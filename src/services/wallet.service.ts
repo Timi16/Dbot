@@ -11,7 +11,7 @@ import {
   VM,
 } from '@demetacode/multi-vm-wallet'
 import { Connection, PublicKey } from '@solana/web3.js'
-import { JsonRpcProvider } from 'ethers'
+import { JsonRpcProvider as EthersJsonRpcProvider } from 'ethers'
 import * as bip39 from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english.js'
 
@@ -181,9 +181,9 @@ export class WalletService {
         connection
       )
     } else {
-      // EVM balance - Create provider correctly
-      const provider = new JsonRpcProvider(config.rpcUrl)
-      nativeBalance = await EVMVM.getNativeBalance(wallet.address, provider)
+      // EVM balance - Cast to any to avoid type mismatch
+      const provider = new EthersJsonRpcProvider(config.rpcUrl)
+      nativeBalance = await EVMVM.getNativeBalance(wallet.address, provider as any)
     }
 
     return {
@@ -268,6 +268,11 @@ export class WalletService {
     }
 
     const wallet = wallets[0]
+    
+    if (!wallet) {
+      throw new NotFoundError('No wallets found')
+    }
+
     const mnemonic = decryptSeed(wallet.encryptedSeed, pin, wallet.salt)
     
     return mnemonic !== null
@@ -287,6 +292,11 @@ export class WalletService {
     }
 
     const wallet = wallets[0]
+    
+    if (!wallet) {
+      throw new NotFoundError('No wallets found')
+    }
+
     const mnemonic = decryptSeed(wallet.encryptedSeed, pin, wallet.salt)
     
     if (!mnemonic) {

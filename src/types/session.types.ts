@@ -123,7 +123,7 @@ export interface SessionData {
 
 export interface CreateSessionParams {
   phone: string
-  userId?: string | null
+  userId?: string | null | undefined
   currentStep: ConversationStep
   context?: SessionContext
   expiryMinutes?: number
