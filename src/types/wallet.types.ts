@@ -36,9 +36,13 @@ export interface WalletInfo {
   chainKey: string
   address: string
   derivationIndex: number
+  derivationPath: string
   isDefault: boolean
   label: string | null
   createdAt: Date
+  // Add these for internal use
+  encryptedSeed: string
+  salt: string
 }
 
 export interface WalletBalance {
