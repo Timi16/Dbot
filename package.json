@@ -5,22 +5,23 @@
   "dependencies": {
     "@demetacode/multi-vm-wallet": "^1.0.0",
     "@prisma/client": "^6.17.0",
-    "express": "^5.1.0",
-    "twilio": "^5.10.4",
-    "dotenv": "^17.2.2",
     "bcrypt": "^6.0.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "groq-sdk": "^0.34.0",
+    "twilio": "^5.10.4",
     "zod": "^4.1.10"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@types/express": "^5.0.5",
     "@types/node": "^24.8.1",
-    "@types/bcrypt": "^6.0.0",
+    "nodemon": "^3.1.1",
     "prisma": "^6.15.0",
-    "typescript": "^5.9.2",
     "tsx": "^4.20.4",
-    "nodemon": "^3.1.1"
+    "typescript": "^5.9.2"
   },
- "scripts": {
+  "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
