@@ -1,7 +1,4 @@
-version: '3.8'
-
 services:
-  # PostgreSQL Database
   whatsapp-bot-db:
     image: postgres:15-alpine
     container_name: whatsapp-bot-db
@@ -20,7 +17,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # WhatsApp Bot Application
   whatsapp-bot-app:
     build:
       context: .
@@ -40,9 +36,9 @@ services:
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
       TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
       GROQ_API_KEY: ${GROQ_API_KEY}
-    volumes:
-      - ./src:/app/src
-      - /app/node_modules
+    # ❗ For production, do NOT bind-mount source; it will overwrite /app.
+    # Remove volumes entirely:
+    # volumes: []
 
 volumes:
   whatsapp-bot-db:

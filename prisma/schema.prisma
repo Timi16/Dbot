@@ -1,0 +1,273 @@
+// Prisma Schema for WhatsApp Crypto Bot
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// USER MODEL
+// ============================================
+model User {
+  id              String            @id @default(uuid())
+  phone           String            @unique // WhatsApp phone number (e.g., "whatsapp:+2348012345678")
+  name            String?           // User's name (collected during onboarding)
+  profileName     String?           @map("profile_name") // WhatsApp profile name
+  
+  // Onboarding
+  onboardingStatus OnboardingStatus @default(PENDING) @map("onboarding_status")
+  onboardingStep  String?           @map("onboarding_step") // Current step in onboarding
+  
+  // Security
+  pinHash         String?           @map("pin_hash") // Hashed PIN (bcrypt)
+  pinEnabled      Boolean           @default(true) @map("pin_enabled") // User can enable/disable PIN requirement
+  failedPinAttempts Int             @default(0) @map("failed_pin_attempts")
+  pinLockedUntil  DateTime?         @map("pin_locked_until") // Temporary lock after too many failed attempts
+  
+  // Timestamps
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  lastActive      DateTime          @default(now()) @map("last_active")
+
+  // Relations
+  wallets         Wallet[]
+  sessions        Session[]
+  transactions    Transaction[]
+  settings        UserSettings?
+
+  @@index([phone])
+  @@index([onboardingStatus])
+  @@map("users")
+}
+
+enum OnboardingStatus {
+  PENDING      // User just sent first message
+  IN_PROGRESS  // Actively going through onboarding
+  COMPLETED    // Onboarding finished
+}
+
+// ============================================
+// WALLET MODEL
+// ============================================
+model Wallet {
+  id              String    @id @default(uuid())
+  userId          String    @map("user_id")
+  
+  // Chain info
+  chain           ChainType // SVM or EVM
+  chainKey        String    @map("chain_key") // ethereum, solana, base, bsc, 0g
+  address         String    // Public wallet address
+  
+  // Security (encrypted seed phrase)
+  encryptedSeed   String    @map("encrypted_seed") // AES encrypted with user's PIN
+  salt            String    // Salt used for encryption
+  
+  // Derivation
+  derivationIndex Int       @default(0) @map("derivation_index") // BIP44 index
+  derivationPath  String    @map("derivation_path") // Full derivation path
+  
+  // Metadata
+  isDefault       Boolean   @default(false) @map("is_default") // Default wallet for this chain
+  label           String?   // User-defined label (optional)
+  
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, chain]) // One wallet per chain per user (for now)
+  @@index([userId])
+  @@index([address])
+  @@index([chain])
+  @@map("wallets")
+}
+
+enum ChainType {
+  SVM  // Solana
+  EVM  // Ethereum, Base, BSC, 0G, etc.
+}
+
+// ============================================
+// SESSION MODEL (Conversation State)
+// ============================================
+model Session {
+  id            String    @id @default(uuid())
+  phone         String    @unique // WhatsApp phone number
+  userId        String?   @map("user_id") // Null if user hasn't completed onboarding
+  
+  // State management
+  currentStep   String    @map("current_step") // Current conversation step
+  context       Json      @default("{}") // Store arbitrary context data (amounts, addresses, etc.)
+  
+  // Expiry
+  expiresAt     DateTime  @map("expires_at")
+  
+  // Timestamps
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  user          User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([phone])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ============================================
+// TRANSACTION MODEL (History)
+// ============================================
+model Transaction {
+  id              String             @id @default(uuid())
+  userId          String             @map("user_id")
+  
+  // Chain & Type
+  chain           ChainType
+  chainKey        String             @map("chain_key") // ethereum, solana, etc.
+  type            TransactionType
+  
+  // Addresses
+  fromAddress     String             @map("from_address")
+  toAddress       String?            @map("to_address") // Null for receive/swap
+  
+  // Amount & Token
+  amount          String             // Store as string to preserve precision
+  tokenAddress    String?            @map("token_address") // Null for native token
+  tokenSymbol     String?            @map("token_symbol")
+  tokenDecimals   Int?               @map("token_decimals")
+  
+  // Blockchain data
+  hash            String             @unique // Transaction hash
+  blockNumber     String?            @map("block_number")
+  gasUsed         String?            @map("gas_used")
+  gasFee          String?            @map("gas_fee")
+  
+  // Status
+  status          TransactionStatus  @default(PENDING)
+  errorMessage    String?            @map("error_message")
+  
+  // Metadata
+  note            String?            // User-added note
+  
+  // Timestamps
+  createdAt       DateTime           @default(now()) @map("created_at")
+  confirmedAt     DateTime?          @map("confirmed_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+
+  // Relations
+  user            User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([hash])
+  @@index([chain])
+  @@index([status])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+enum TransactionType {
+  SEND     // User sent crypto
+  RECEIVE  // User received crypto
+  SWAP     // Token swap
+}
+
+enum TransactionStatus {
+  PENDING    // Transaction submitted
+  CONFIRMED  // Transaction confirmed on-chain
+  FAILED     // Transaction failed
+}
+
+// ============================================
+// USER SETTINGS MODEL
+// ============================================
+model UserSettings {
+  id                    String    @id @default(uuid())
+  userId                String    @unique @map("user_id")
+  
+  // Security Settings
+  requirePinForSend     Boolean   @default(true) @map("require_pin_for_send")
+  requirePinForSwap     Boolean   @default(true) @map("require_pin_for_swap")
+  requirePinAmount      String?   @map("require_pin_amount") // Require PIN for amounts above this (in USD)
+  
+  // Notification Settings
+  notifyOnReceive       Boolean   @default(true) @map("notify_on_receive")
+  notifyOnSend          Boolean   @default(true) @map("notify_on_send")
+  notifyOnConfirmation  Boolean   @default(true) @map("notify_on_confirmation")
+  
+  // Display Settings
+  preferredCurrency     String    @default("USD") @map("preferred_currency") // USD, NGN, EUR, etc.
+  hideSmallBalances     Boolean   @default(false) @map("hide_small_balances") // Hide balances < $1
+  
+  // Language
+  language              String    @default("en") // en, es, fr, etc.
+  
+  // Timestamps
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+// ============================================
+// CONTACT MODEL (Saved addresses)
+// ============================================
+model Contact {
+  id              String    @id @default(uuid())
+  userId          String    @map("user_id")
+  
+  // Contact info
+  name            String    // Friendly name (e.g., "John", "Mom")
+  chain           ChainType
+  address         String
+  
+  // Metadata
+  notes           String?   // Optional notes
+  isFavorite      Boolean   @default(false) @map("is_favorite")
+  
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@unique([userId, address]) // One contact per address per user
+  @@index([userId])
+  @@map("contacts")
+}
+
+// ============================================
+// WEBHOOK LOG MODEL (Debug/Audit)
+// ============================================
+model WebhookLog {
+  id              String    @id @default(uuid())
+  
+  // Request data
+  phone           String
+  message         String
+  profileName     String?   @map("profile_name")
+  messageSid      String    @map("message_sid")
+  
+  // Response data
+  responseStatus  String?   @map("response_status") // success, error
+  responseMessage String?   @map("response_message")
+  errorDetails    String?   @map("error_details")
+  
+  // Processing
+  processingTime  Int?      @map("processing_time") // milliseconds
+  
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@index([phone])
+  @@index([createdAt])
+  @@map("webhook_logs")
+}

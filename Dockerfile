@@ -1,41 +1,28 @@
+# -------- Base (builder) --------
 FROM node:20-alpine AS base
-
-# Install dependencies for native modules
 RUN apk add --no-cache libc6-compat python3 make g++
-
 WORKDIR /app
 
-# Copy package files
+# Install deps first for better caching
 COPY package.json package-lock.json* ./
-COPY prisma ./prisma/
-
-# Install dependencies
+COPY prisma ./prisma
 RUN npm ci
-
-# Generate Prisma Client
 RUN npx prisma generate
 
-# Copy source code
+# Add source and build
 COPY . .
-
-# Build TypeScript
 RUN npm run build
 
-# Production stage
+# -------- Runner (production) --------
 FROM node:20-alpine AS runner
-
 RUN apk add --no-cache libc6-compat
-
 WORKDIR /app
 
-# Copy built files and dependencies
+# Copy only what's needed at runtime
 COPY --from=base /app/node_modules ./node_modules
-COPY --from=base /app/dist ./dist
 COPY --from=base /app/package.json ./
 COPY --from=base /app/prisma ./prisma
+COPY --from=base /app/dist ./dist
 
-# Expose port
 EXPOSE 3000
-
-# Run migrations and start app
 CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]

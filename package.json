@@ -20,12 +20,17 @@
     "tsx": "^4.20.4",
     "nodemon": "^3.1.1"
   },
-  "scripts": {
-    "dev": "nodemon --exec tsx src/index.ts",
+ "scripts": {
+    "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "prisma:deploy": "prisma migrate deploy",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f whatsapp-bot-app",
+    "docker:rebuild": "docker-compose up -d --build"
   }
 }
