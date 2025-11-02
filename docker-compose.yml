@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  whatsapp-bot-db:
+    image: postgres:15-alpine
+    container_name: whatsapp-bot-db
+    restart: unless-stopped
+    volumes:
+      - whatsapp-bot-db:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # WhatsApp Bot Application
+  whatsapp-bot-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-bot-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    depends_on:
+      whatsapp-bot-db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@whatsapp-bot-db:5432/${POSTGRES_DB}?schema=public
+      PORT: ${PORT:-3000}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+    volumes:
+      - ./src:/app/src
+      - /app/node_modules
+
+volumes:
+  whatsapp-bot-db:
