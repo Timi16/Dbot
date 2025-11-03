@@ -7,6 +7,12 @@ import twilio from 'twilio'
  */
 
 // Initialize Twilio client
+export const twilioClient = twilio(
+  env.TWILIO_ACCOUNT_SID,
+  env.TWILIO_AUTH_TOKEN
+)
+
+// Twilio configuration constants
 export const twilioConfig = {
   accountSid: env.TWILIO_ACCOUNT_SID,
   authToken: env.TWILIO_AUTH_TOKEN,

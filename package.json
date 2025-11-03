@@ -6,14 +6,17 @@
     "@demetacode/multi-vm-wallet": "^1.0.0",
     "@prisma/client": "^6.17.0",
     "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "groq-sdk": "^0.34.0",
+    "helmet": "^8.1.0",
     "twilio": "^5.10.4",
     "zod": "^4.1.10"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
+    "@types/cors": "^2.8.19",
     "@types/crypto-js": "^4.2.2",
     "@types/express": "^5.0.5",
     "@types/node": "^24.8.1",
