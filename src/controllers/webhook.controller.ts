@@ -1,5 +1,5 @@
 /**
- * Webhook Controller
+ * Webhook Controller - Improved Error Handling
  * Handles incoming WhatsApp messages and routes to appropriate handlers
  */
 
@@ -78,7 +78,7 @@ export async function handleIncomingMessage(
       profileName,
       messageSid,
       responseStatus: 'success',
-      responseMessage: responseMessage.substring(0, 200), // First 200 chars
+      responseMessage: responseMessage.substring(0, 200),
       processingTime,
       errorDetails: null,
     })
@@ -166,36 +166,57 @@ async function handleOnboardingFlow(
  * Handle main conversation flow for onboarded users
  */
 async function handleMainFlow(phone: string, message: string): Promise<string> {
-  // Get user
-  const user = await prisma.user.findUnique({ where: { phone } })
-  if (!user) {
-    return 'User not found. Please start over by typing "start".'
+  try {
+    // Get user
+    const user = await prisma.user.findUnique({ where: { phone } })
+    if (!user) {
+      return 'User not found. Please start over by typing "start".'
+    }
+
+    // Get or create session
+    const session = await sessionService.getOrCreateSession(
+      phone,
+      MainStep.IDLE,
+      user.id
+    )
+
+    // Check simple intents first (for faster response)
+    const simpleIntent = aiService.detectSimpleIntent(message)
+
+    if (simpleIntent) {
+      return handleSimpleIntent(simpleIntent, phone, user.id, session.currentStep)
+    }
+
+    // If in middle of a flow, handle step-by-step
+    if (session.currentStep !== MainStep.IDLE) {
+      return handleFlowStep(phone, user.id, message, session.currentStep, session.context)
+    }
+
+    // Use AI to understand intent
+    console.log('🤖 Analyzing message with AI...')
+    const aiResponse = await aiService.analyzeMessage(message, {
+      userName: user.name || 'User',
+      conversationHistory: [
+        {
+          role: 'system',
+          content: `Context: User's name is ${user.name || 'not set'}. User's profile name is ${user.profileName || 'not set'}.`
+        }
+      ]
+    })
+    
+    console.log(`✅ AI detected intent: ${aiResponse.intent} (confidence: ${aiResponse.confidence})`)
+
+    // If AI couldn't determine intent well, use response directly
+    if (aiResponse.confidence < 0.4 || aiResponse.intent === Intent.UNKNOWN) {
+      return aiResponse.response || getHelpMessage()
+    }
+
+    // Route to appropriate handler based on intent (pass AI response for custom messages)
+    return routeByIntent(aiResponse.intent, phone, user.id, aiResponse.entities, aiResponse.response)
+  } catch (error) {
+    console.error('❌ Error in main flow:', error)
+    return "I'm having trouble processing that right now. Type 'help' to see what I can do!"
   }
-
-  // Get or create session
-  const session = await sessionService.getOrCreateSession(
-    phone,
-    MainStep.IDLE,
-    user.id
-  )
-
-  // Check simple intents first (for faster response)
-  const simpleIntent = aiService.detectSimpleIntent(message)
-
-  if (simpleIntent) {
-    return handleSimpleIntent(simpleIntent, phone, user.id, session.currentStep)
-  }
-
-  // If in middle of a flow, handle step-by-step
-  if (session.currentStep !== MainStep.IDLE) {
-    return handleFlowStep(phone, user.id, message, session.currentStep, session.context)
-  }
-
-  // Use AI to understand intent
-  const aiResponse = await aiService.analyzeMessage(message)
-
-  // Route to appropriate handler based on intent
-  return routeByIntent(aiResponse.intent, phone, user.id, aiResponse.entities)
 }
 
 /**
@@ -209,6 +230,7 @@ function handleSimpleIntent(
 ): string {
   switch (intent) {
     case Intent.HELP:
+      // For simple help keyword, show full help menu
       return getHelpMessage()
 
     case Intent.CONFIRM:
@@ -247,35 +269,42 @@ async function routeByIntent(
   intent: Intent,
   phone: string,
   userId: string,
-  entities: any
+  entities: any,
+  aiResponse?: string
 ): Promise<string> {
-  switch (intent) {
-    case Intent.CHECK_BALANCE:
-      return handleCheckBalance(userId, entities.chain)
+  try {
+    switch (intent) {
+      case Intent.CHECK_BALANCE:
+        return handleCheckBalance(userId, entities.chain)
 
-    case Intent.VIEW_ADDRESS:
-      return handleViewAddress(userId, entities.chain)
+      case Intent.VIEW_ADDRESS:
+        return handleViewAddress(userId, entities.chain)
 
-    case Intent.SEND_CRYPTO:
-      return handleSendCrypto(phone, userId, entities)
+      case Intent.SEND_CRYPTO:
+        return handleSendCrypto(phone, userId, entities)
 
-    case Intent.RECEIVE_CRYPTO:
-      return handleReceiveCrypto(userId, entities.chain)
+      case Intent.RECEIVE_CRYPTO:
+        return handleReceiveCrypto(userId, entities.chain)
 
-    case Intent.SWAP_TOKENS:
-      return handleSwapTokens(phone, userId, entities)
+      case Intent.SWAP_TOKENS:
+        return handleSwapTokens(phone, userId, entities)
 
-    case Intent.TRANSACTION_HISTORY:
-      return handleTransactionHistory(userId, entities.chain)
+      case Intent.TRANSACTION_HISTORY:
+        return handleTransactionHistory(userId, entities.chain)
 
-    case Intent.SETTINGS:
-      return handleSettings(userId)
+      case Intent.SETTINGS:
+        return handleSettings(userId)
 
-    case Intent.HELP:
-      return getHelpMessage()
+      case Intent.HELP:
+        // Use AI's custom response if available, otherwise use default
+        return aiResponse || getHelpMessage()
 
-    default:
-      return "I didn't quite understand that. Type 'help' to see what I can do!"
+      default:
+        return aiResponse || "I didn't quite understand that. Type 'help' to see what I can do!"
+    }
+  } catch (error) {
+    console.error(`❌ Error routing intent ${intent}:`, error)
+    return "Something went wrong. Type 'help' to see what I can do!"
   }
 }
 
@@ -286,23 +315,28 @@ async function handleCheckBalance(
   userId: string,
   chain?: string
 ): Promise<string> {
-  if (chain) {
-    // Get balance for specific chain
-    const balance = await walletService.getWalletBalance(userId, chain as any)
-    return `🟣 ${balance.chainName}\n\nAddress: ${balance.address}\n\nBalance: ${balance.nativeBalance.formatted} ${balance.nativeSymbol}`
-  }
+  try {
+    if (chain) {
+      // Get balance for specific chain
+      const balance = await walletService.getWalletBalance(userId, chain as any)
+      return `🟣 ${balance.chainName}\n\nAddress: ${balance.address}\n\nBalance: ${balance.nativeBalance.formatted} ${balance.nativeSymbol}`
+    }
 
-  // Get all balances
-  const balances = await walletService.getAllBalances(userId)
-  
-  let response = '💰 Your Wallet Balances:\n\n'
-  for (const bal of balances) {
-    response += `${bal.chainKey === 'solana' ? '🟣' : '🔵'} ${bal.chainName}: ${bal.nativeBalance.formatted} ${bal.nativeSymbol}\n`
+    // Get all balances
+    const balances = await walletService.getAllBalances(userId)
+    
+    let response = '💰 Your Wallet Balances:\n\n'
+    for (const bal of balances) {
+      response += `${bal.chainKey === 'solana' ? '🟣' : '🔵'} ${bal.chainName}: ${bal.nativeBalance.formatted} ${bal.nativeSymbol}\n`
+    }
+    
+    response += '\nType "send" to transfer funds or "swap" to exchange tokens.'
+    
+    return response
+  } catch (error) {
+    console.error('Error checking balance:', error)
+    return 'Sorry, I could not fetch your balance right now. Please try again.'
   }
-  
-  response += '\nType "send" to transfer funds or "swap" to exchange tokens.'
-  
-  return response
 }
 
 /**
@@ -312,19 +346,24 @@ async function handleViewAddress(
   userId: string,
   chain?: string
 ): Promise<string> {
-  if (chain) {
-    const wallet = await walletService.getUserWallet(userId, chain as any)
-    return `${chain === 'solana' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()} Address:\n\n${wallet.address}\n\nShare this address to receive crypto.`
-  }
+  try {
+    if (chain) {
+      const wallet = await walletService.getUserWallet(userId, chain as any)
+      return `${chain === 'solana' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()} Address:\n\n${wallet.address}\n\nShare this address to receive crypto.`
+    }
 
-  const wallets = await walletService.getUserWallets(userId)
-  let response = '📬 Your Wallet Addresses:\n\n'
-  
-  for (const wallet of wallets) {
-    response += `${wallet.chain === 'SVM' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()}:\n${wallet.address}\n\n`
+    const wallets = await walletService.getUserWallets(userId)
+    let response = '📬 Your Wallet Addresses:\n\n'
+    
+    for (const wallet of wallets) {
+      response += `${wallet.chain === 'SVM' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()}:\n${wallet.address}\n\n`
+    }
+    
+    return response
+  } catch (error) {
+    console.error('Error viewing address:', error)
+    return 'Sorry, I could not fetch your address right now. Please try again.'
   }
-  
-  return response
 }
 
 /**
@@ -372,24 +411,29 @@ async function handleTransactionHistory(
   userId: string,
   chain?: string
 ): Promise<string> {
-  const transactions = await transactionService.getTransactionHistory(userId, {
-    chainKey: chain as any,
-    limit: 10,
-  })
+  try {
+    const transactions = await transactionService.getTransactionHistory(userId, {
+      chainKey: chain as any,
+      limit: 10,
+    })
 
-  if (transactions.length === 0) {
-    return "You don't have any transactions yet."
+    if (transactions.length === 0) {
+      return "You don't have any transactions yet."
+    }
+
+    let response = '📜 Recent Transactions:\n\n'
+    
+    for (const tx of transactions.slice(0, 5)) {
+      response += `${tx.type} - ${tx.amount} ${tx.tokenSymbol || tx.chainKey}\n`
+      response += `Status: ${tx.status}\n`
+      response += `${new Date(tx.createdAt).toLocaleDateString()}\n\n`
+    }
+
+    return response
+  } catch (error) {
+    console.error('Error fetching transactions:', error)
+    return 'Sorry, I could not fetch your transaction history right now.'
   }
-
-  let response = '📜 Recent Transactions:\n\n'
-  
-  for (const tx of transactions.slice(0, 5)) {
-    response += `${tx.type} - ${tx.amount} ${tx.tokenSymbol || tx.chainKey}\n`
-    response += `Status: ${tx.status}\n`
-    response += `${new Date(tx.createdAt).toLocaleDateString()}\n\n`
-  }
-
-  return response
 }
 
 /**
