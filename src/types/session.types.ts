@@ -57,6 +57,12 @@ export enum MainStep {
   
   // Help
   HELP = 'HELP',
+  SWAP_TOKENS_CHAIN = "SWAP_TOKENS_CHAIN",
+  SWAP_TOKENS_FROM = "SWAP_TOKENS_FROM",
+  SWAP_TOKENS_TO = "SWAP_TOKENS_TO",
+  SWAP_TOKENS_AMOUNT = "SWAP_TOKENS_AMOUNT",
+  SWAP_TOKENS_CONFIRM = "SWAP_TOKENS_CONFIRM",
+  SWAP_TOKENS_PIN = "SWAP_TOKENS_PIN",
 }
 
 export type ConversationStep = OnboardingStep | MainStep

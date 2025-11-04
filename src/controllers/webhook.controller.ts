@@ -1,5 +1,5 @@
 /**
- * Webhook Controller - Improved Error Handling
+ * Webhook Controller - Complete with Transaction Features
  * Handles incoming WhatsApp messages and routes to appropriate handlers
  */
 
@@ -257,9 +257,53 @@ async function handleFlowStep(
   currentStep: string,
   context: any
 ): Promise<string> {
-  // This would be implemented based on current step
-  // For now, return placeholder
-  return 'Feature in progress. Type "cancel" to go back to main menu.'
+  try {
+    switch (currentStep) {
+      // Send crypto flow
+      case MainStep.SEND_CRYPTO_CHAIN:
+        return await handleSendChainStep(phone, userId, message, context)
+      
+      case MainStep.SEND_CRYPTO_ADDRESS:
+        return await handleSendAddressStep(phone, userId, message, context)
+      
+      case MainStep.SEND_CRYPTO_AMOUNT:
+        return await handleSendAmountStep(phone, userId, message, context)
+      
+      case MainStep.SEND_CRYPTO_CONFIRM:
+        return await handleSendConfirmStep(phone, userId, message, context)
+      
+      case MainStep.SEND_CRYPTO_PIN:
+        return await handleSendPinStep(phone, userId, message, context)
+
+      // Swap flow
+      case MainStep.SWAP_TOKENS_CHAIN:
+        return await handleSwapChainStep(phone, userId, message, context)
+      
+      case MainStep.SWAP_TOKENS_FROM:
+        return await handleSwapFromTokenStep(phone, userId, message, context)
+      
+      case MainStep.SWAP_TOKENS_TO:
+        return await handleSwapToTokenStep(phone, userId, message, context)
+      
+      case MainStep.SWAP_TOKENS_AMOUNT:
+        return await handleSwapAmountStep(phone, userId, message, context)
+      
+      case MainStep.SWAP_TOKENS_CONFIRM:
+        return await handleSwapConfirmStep(phone, userId, message, context)
+      
+      case MainStep.SWAP_TOKENS_PIN:
+        return await handleSwapPinStep(phone, userId, message, context)
+
+      default:
+        // Reset to idle if unknown step
+        await sessionService.resetSession(phone, userId)
+        return 'Something went wrong. Type "help" to see what I can do!'
+    }
+  } catch (error) {
+    console.error('Error in flow step:', error)
+    await sessionService.resetSession(phone, userId)
+    return 'An error occurred. Please start over. Type "help" for options.'
+  }
 }
 
 /**
@@ -374,13 +418,35 @@ async function handleSendCrypto(
   userId: string,
   entities: any
 ): Promise<string> {
-  // Start send flow
-  await sessionService.updateSession(phone, {
-    currentStep: MainStep.SEND_CRYPTO_CHAIN,
-    context: entities,
-  })
+  try {
+    // If all required info is provided, execute immediately
+    if (entities.chain && entities.address && entities.amount) {
+      return await executeSendTransaction(userId, entities)
+    }
 
-  return 'Which chain would you like to send from?\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n⚫ 0G'
+    // Start send flow if partial info
+    await sessionService.updateSession(phone, {
+      currentStep: MainStep.SEND_CRYPTO_CHAIN,
+      context: entities,
+    })
+
+    if (!entities.chain) {
+      return 'Which chain would you like to send from?\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n⚫ 0G'
+    }
+
+    if (!entities.address) {
+      return `Please provide the recipient's address on ${entities.chain}.`
+    }
+
+    if (!entities.amount) {
+      return `How much would you like to send?`
+    }
+
+    return 'Please provide: chain, address, and amount to send.'
+  } catch (error) {
+    console.error('Error initiating send:', error)
+    return 'Failed to initiate send. Please try again with: send [amount] [token] to [address] on [chain]'
+  }
 }
 
 /**
@@ -401,7 +467,35 @@ async function handleSwapTokens(
   userId: string,
   entities: any
 ): Promise<string> {
-  return 'Swap feature coming soon! 🔄'
+  try {
+    // If all required info is provided, execute immediately
+    if (entities.chain && entities.fromToken && entities.toToken && entities.amount) {
+      return await executeSwapTransaction(userId, entities)
+    }
+
+    // Start swap flow if partial info
+    await sessionService.updateSession(phone, {
+      currentStep: MainStep.SWAP_TOKENS_CHAIN,
+      context: entities,
+    })
+
+    if (!entities.chain) {
+      return 'Which chain would you like to swap on?\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC'
+    }
+
+    if (!entities.fromToken || !entities.toToken) {
+      return `Which tokens would you like to swap? (e.g., "swap 1 SOL for USDC")`
+    }
+
+    if (!entities.amount) {
+      return `How much ${entities.fromToken} would you like to swap?`
+    }
+
+    return 'Please provide: amount, from token, to token, and chain.'
+  } catch (error) {
+    console.error('Error initiating swap:', error)
+    return 'Failed to initiate swap. Please try again with: swap [amount] [from token] for [to token] on [chain]'
+  }
 }
 
 /**
@@ -441,6 +535,394 @@ async function handleTransactionHistory(
  */
 async function handleSettings(userId: string): Promise<string> {
   return '⚙️ Settings:\n\n1. Change PIN\n2. Security settings\n3. Export seed phrase\n\nReply with a number to continue.'
+}
+
+// ==================== SEND FLOW HANDLERS ====================
+
+/**
+ * Handle chain selection for send
+ */
+async function handleSendChainStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const chain = message.toLowerCase().trim()
+  const validChains = ['solana', 'ethereum', 'base', 'bsc', '0g']
+  
+  if (!validChains.includes(chain)) {
+    return 'Please select a valid chain:\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n⚫ 0G'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SEND_CRYPTO_ADDRESS,
+    context: { ...context, chain },
+  })
+
+  return `Great! What's the recipient's ${chain} address?`
+}
+
+/**
+ * Handle address input for send
+ */
+async function handleSendAddressStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const address = message.trim()
+  
+  // Basic validation (detailed validation happens in transaction service)
+  if (address.length < 20) {
+    return 'That doesn\'t look like a valid address. Please provide a valid address.'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SEND_CRYPTO_AMOUNT,
+    context: { ...context, address },
+  })
+
+  return 'How much would you like to send? (e.g., 0.5 or 1.5)'
+}
+
+/**
+ * Handle amount input for send
+ */
+async function handleSendAmountStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const amount = parseFloat(message.trim())
+  
+  if (isNaN(amount) || amount <= 0) {
+    return 'Please enter a valid amount (e.g., 0.5 or 1.5)'
+  }
+
+  const { chain, address, tokenAddress } = context
+  const tokenSymbol = context.tokenSymbol || (chain === 'solana' ? 'SOL' : 'ETH')
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SEND_CRYPTO_CONFIRM,
+    context: { ...context, amount },
+  })
+
+  return `📤 Send Summary:\n\n` +
+    `Amount: ${amount} ${tokenSymbol}\n` +
+    `To: ${address.substring(0, 10)}...${address.substring(address.length - 8)}\n` +
+    `Chain: ${chain}\n\n` +
+    `Reply "confirm" to proceed or "cancel" to abort.`
+}
+
+/**
+ * Handle confirmation for send
+ */
+async function handleSendConfirmStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const response = message.toLowerCase().trim()
+  
+  if (response === 'cancel') {
+    await sessionService.resetSession(phone, userId)
+    return '❌ Transaction cancelled.'
+  }
+  
+  if (response !== 'confirm' && response !== 'yes') {
+    return 'Please reply "confirm" to proceed or "cancel" to abort.'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SEND_CRYPTO_PIN,
+    context,
+  })
+
+  return '🔐 Please enter your PIN to authorize the transaction:'
+}
+
+/**
+ * Handle PIN and execute send
+ */
+async function handleSendPinStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const pin = message.trim()
+  
+  try {
+    // Execute transaction
+    const result = await executeSendTransaction(userId, { ...context, pin })
+    
+    // Reset session
+    await sessionService.resetSession(phone, userId)
+    
+    return result
+  } catch (error) {
+    console.error('Send transaction failed:', error)
+    await sessionService.resetSession(phone, userId)
+    return `❌ Transaction failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+  }
+}
+
+/**
+ * Execute send transaction
+ */
+async function executeSendTransaction(
+  userId: string,
+  params: {
+    chain: string
+    address: string
+    amount: number
+    tokenAddress?: string
+    pin: string
+    note?: string
+  }
+): Promise<string> {
+  try {
+    let transaction
+
+    // Determine chain type (SVM or EVM)
+    const chainType = params.chain === 'solana' ? 'SVM' : 'EVM'
+
+    if (params.tokenAddress) {
+      // Send token
+      transaction = await transactionService.sendToken({
+        userId,
+        chain: chainType,
+        chainKey: params.chain as any,
+        toAddress: params.address,
+        amount: params.amount,
+        tokenAddress: params.tokenAddress,
+        pin: params.pin,
+        note: params.note,
+      })
+    } else {
+      // Send native token
+      transaction = await transactionService.sendNative({
+        userId,
+        chain: chainType,
+        chainKey: params.chain as any,
+        toAddress: params.address,
+        amount: params.amount,
+        pin: params.pin,
+        note: params.note,
+      })
+    }
+
+    return `✅ Transaction Sent!\n\n` +
+      `Amount: ${transaction.amount} ${transaction.tokenSymbol}\n` +
+      `To: ${transaction.toAddress?.substring(0, 10)}...${transaction.toAddress?.substring(transaction.toAddress.length - 8)}\n` +
+      `Hash: ${transaction.hash.substring(0, 20)}...\n` +
+      `Status: ${transaction.status}\n\n` +
+      `Your transaction is being processed!`
+  } catch (error) {
+    throw error
+  }
+}
+
+// ==================== SWAP FLOW HANDLERS ====================
+
+/**
+ * Handle chain selection for swap
+ */
+async function handleSwapChainStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const chain = message.toLowerCase().trim()
+  const validChains = ['solana', 'ethereum', 'base', 'bsc']
+  
+  if (!validChains.includes(chain)) {
+    return 'Please select a valid chain:\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SWAP_TOKENS_FROM,
+    context: { ...context, chain },
+  })
+
+  return `What token would you like to swap from? (e.g., SOL, USDC, ETH)`
+}
+
+/**
+ * Handle from token selection
+ */
+async function handleSwapFromTokenStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const fromToken = message.trim().toUpperCase()
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SWAP_TOKENS_TO,
+    context: { ...context, fromToken },
+  })
+
+  return `What token would you like to swap to? (e.g., USDC, SOL)`
+}
+
+/**
+ * Handle to token selection
+ */
+async function handleSwapToTokenStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const toToken = message.trim().toUpperCase()
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SWAP_TOKENS_AMOUNT,
+    context: { ...context, toToken },
+  })
+
+  return `How much ${context.fromToken} would you like to swap?`
+}
+
+/**
+ * Handle amount for swap
+ */
+async function handleSwapAmountStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const amount = parseFloat(message.trim())
+  
+  if (isNaN(amount) || amount <= 0) {
+    return 'Please enter a valid amount (e.g., 0.5 or 1.5)'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SWAP_TOKENS_CONFIRM,
+    context: { ...context, amount },
+  })
+
+  return `🔄 Swap Summary:\n\n` +
+    `Swap: ${amount} ${context.fromToken} → ${context.toToken}\n` +
+    `Chain: ${context.chain}\n` +
+    `Slippage: 1.5%\n\n` +
+    `Reply "confirm" to proceed or "cancel" to abort.`
+}
+
+/**
+ * Handle swap confirmation
+ */
+async function handleSwapConfirmStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const response = message.toLowerCase().trim()
+  
+  if (response === 'cancel') {
+    await sessionService.resetSession(phone, userId)
+    return '❌ Swap cancelled.'
+  }
+  
+  if (response !== 'confirm' && response !== 'yes') {
+    return 'Please reply "confirm" to proceed or "cancel" to abort.'
+  }
+
+  await sessionService.updateSession(phone, {
+    currentStep: MainStep.SWAP_TOKENS_PIN,
+    context,
+  })
+
+  return '🔐 Please enter your PIN to authorize the swap:'
+}
+
+/**
+ * Handle PIN and execute swap
+ */
+async function handleSwapPinStep(
+  phone: string,
+  userId: string,
+  message: string,
+  context: any
+): Promise<string> {
+  const pin = message.trim()
+  
+  try {
+    // Execute swap
+    const result = await executeSwapTransaction(userId, { ...context, pin })
+    
+    // Reset session
+    await sessionService.resetSession(phone, userId)
+    
+    return result
+  } catch (error) {
+    console.error('Swap transaction failed:', error)
+    await sessionService.resetSession(phone, userId)
+    return `❌ Swap failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+  }
+}
+
+/**
+ * Execute swap transaction
+ */
+async function executeSwapTransaction(
+  userId: string,
+  params: {
+    chain: string
+    fromToken: string
+    toToken: string
+    amount: number
+    pin: string
+    slippage?: number
+  }
+): Promise<string> {
+  try {
+    // Determine chain type (SVM or EVM)
+    const chainType = params.chain === 'solana' ? 'SVM' : 'EVM'
+
+    // Note: Token addresses need to be resolved from symbols
+    // This is a simplified version - you'd need a token registry
+    const fromTokenInfo = {
+      address: params.fromToken === 'SOL' ? 'native' : params.fromToken,
+      symbol: params.fromToken,
+      decimals: 9,
+    }
+
+    const toTokenInfo = {
+      address: params.toToken,
+      symbol: params.toToken,
+      decimals: 9,
+    }
+
+    const transaction = await transactionService.swap({
+      userId,
+      chain: chainType,
+      chainKey: params.chain as any,
+      fromToken: fromTokenInfo as any,
+      toToken: toTokenInfo as any,
+      amount: params.amount,
+      slippage: params.slippage || 150,
+      pin: params.pin,
+    })
+
+    return `✅ Swap Complete!\n\n` +
+      `Swapped: ${transaction.amount} ${params.fromToken} → ${params.toToken}\n` +
+      `Hash: ${transaction.hash.substring(0, 20)}...\n` +
+      `Status: ${transaction.status}\n\n` +
+      `Your swap is being processed!`
+  } catch (error) {
+    throw error
+  }
 }
 
 /**

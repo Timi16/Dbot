@@ -71,7 +71,7 @@ export interface TransferParams {
   amount: number
   tokenAddress?: string | null
   pin: string
-  note?: string | null
+  note?: string | null | undefined
 }
 
 export interface SwapParams {
