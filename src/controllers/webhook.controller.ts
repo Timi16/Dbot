@@ -25,6 +25,12 @@ import {
   sanitizeInput,
   getUserFriendlyErrorMessage,
 } from '../utils/index.js'
+import {
+  getTokenDetails_DEXSCREENER,
+  getTokenDetails_DEXTOOLS,
+  getCustomTokenDataForEvmChainUsingUniSwapV30g,
+} from '../services/token.service.js'
+import type { TokenDetails } from '../types/token.types.js'
 
 /**
  * Main webhook handler - receives all incoming messages
