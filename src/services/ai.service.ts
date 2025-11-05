@@ -23,9 +23,14 @@ export class AIService {
             userName?: string
             previousIntent?: string
             conversationHistory?: GroqMessage[]
+            lastViewedToken?: {
+                symbol: string
+                name: string
+                chain: string
+                address: string
+            }
         }
     ): Promise<ParsedAIResponse> {
-        // Sanitize input
         const cleanMessage = sanitizeInput(userMessage)
 
         if (!cleanMessage) {
@@ -33,27 +38,22 @@ export class AIService {
         }
 
         try {
-            // Build messages array with enhanced system prompt
+            // Build system prompt with context
+            let systemPrompt = SYSTEM_PROMPTS.main
+
+            // Add token context if user just viewed a token
+            if (context?.lastViewedToken) {
+                systemPrompt += '\n\n' + SYSTEM_PROMPTS.withTokenContext(
+                    context.lastViewedToken.symbol,
+                    context.lastViewedToken.name,
+                    context.lastViewedToken.chain
+                )
+            }
+
             const messages: GroqMessage[] = [
                 {
                     role: 'system',
-                    content: `${SYSTEM_PROMPTS.main}
-
-CRITICAL: You MUST respond with ONLY valid JSON. No markdown, no code blocks, no explanations.
-Your response must be a single JSON object with this exact structure:
-{
-  "intent": "one of: create_wallet, check_balance, send_crypto, receive_crypto, swap_tokens, transaction_history, view_address, settings, change_pin, toggle_pin, help, confirm, cancel, unknown",
-  "entities": {},
-  "confidence": 0.95,
-  "response": "your message to the user"
-}
-
-Example valid responses:
-{"intent":"check_balance","entities":{"chain":"solana"},"confidence":0.95,"response":"Let me check your Solana balance."}
-{"intent":"view_address","entities":{},"confidence":0.9,"response":"Here's your wallet address."}
-{"intent":"help","entities":{},"confidence":1.0,"response":"I can help you with crypto transactions!"}
-
-DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or after the JSON.`,
+                    content: systemPrompt,
                 },
             ]
 
@@ -68,6 +68,11 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
                 content: cleanMessage,
             })
 
+            console.log('🤖 Sending to AI:', {
+                message: cleanMessage.substring(0, 50),
+                hasTokenContext: !!context?.lastViewedToken,
+            })
+
             // Call Groq API with JSON mode
             const completion = await groqClient.chat.completions.create({
                 model: groqConfig.model,
@@ -75,7 +80,7 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
                 temperature: groqConfig.temperature,
                 max_tokens: groqConfig.maxTokens,
                 top_p: groqConfig.topP,
-                response_format: { type: 'json_object' }, // Force JSON response
+                response_format: { type: 'json_object' },
             })
 
             const responseContent = completion.choices[0]?.message?.content
@@ -90,11 +95,18 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
             // Parse JSON response
             const parsed = this.parseAIResponse(responseContent)
 
+            // Log what we detected
+            console.log('✅ Detected:', {
+                intent: parsed.intent,
+                chain: parsed.entities.chain,
+                hasAddress: !!parsed.entities.address,
+                hasTokenAddress: !!(parsed.entities as any).toTokenAddress,
+            })
+
             return parsed
         } catch (error) {
             console.error('❌ AI Service error:', error)
 
-            // If it's a Groq API error, provide more details
             if (error instanceof Error) {
                 console.error('Error details:', error.message)
             }
@@ -102,6 +114,7 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
             return this.createUnknownIntent('AI processing failed')
         }
     }
+
 
 
     /**
@@ -242,7 +255,15 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
 
         // Don't detect intents if it's a casual greeting
         if (isCasualMessage(message)) {
-            return null // Let main flow handle it
+            return null
+        }
+
+        // Check for contract addresses with buy intent
+        const hasBuyKeyword = /\b(buy|purchase|get|swap|trade)\b/.test(lower)
+        const hasContractAddress = /\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b/.test(message)
+
+        if (hasBuyKeyword && hasContractAddress) {
+            return Intent.SWAP_TOKENS
         }
 
         // Confirmation keywords
@@ -263,7 +284,7 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
             return Intent.HELP
         }
 
-        // Trading keywords
+        // Trading keywords (without addresses - just simple words)
         const buyKeywords = ['buy', 'purchase', 'get']
         if (buyKeywords.includes(lower)) {
             return Intent.SWAP_TOKENS
@@ -276,6 +297,7 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
 
         return null
     }
+
 
     /**
      * Generate contextual response based on error
