@@ -4,6 +4,7 @@
  */
 
 import { groqClient, groqConfig, SYSTEM_PROMPTS } from '../config/index.js'
+import { isCasualMessage } from '../controllers/index.js'
 import {
     Intent,
     type AIResponse,
@@ -239,6 +240,11 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
     detectSimpleIntent(message: string): Intent | null {
         const lower = message.toLowerCase().trim()
 
+        // Don't detect intents if it's a casual greeting
+        if (isCasualMessage(message)) {
+            return null // Let main flow handle it
+        }
+
         // Confirmation keywords
         const confirmKeywords = ['yes', 'y', 'confirm', 'ok', 'okay', 'sure', 'proceed', 'continue', 'saved']
         if (confirmKeywords.includes(lower)) {
@@ -255,6 +261,17 @@ DO NOT wrap the JSON in markdown code blocks. DO NOT add any text before or afte
         const helpKeywords = ['help', 'menu', 'commands', 'options']
         if (helpKeywords.includes(lower)) {
             return Intent.HELP
+        }
+
+        // Trading keywords
+        const buyKeywords = ['buy', 'purchase', 'get']
+        if (buyKeywords.includes(lower)) {
+            return Intent.SWAP_TOKENS
+        }
+
+        const swapKeywords = ['swap', 'trade', 'exchange']
+        if (swapKeywords.includes(lower)) {
+            return Intent.SWAP_TOKENS
         }
 
         return null
