@@ -1,0 +1,1189 @@
+/**
+ * Webhook Controller - Complete with Transaction Features
+ * Handles incoming WhatsApp messages and routes to appropriate handlers
+ */
+import { twilioService } from '../services/twilio.service.js';
+import { aiService } from '../services/ai.service.js';
+import { onboardingService } from '../services/onboarding.service.js';
+import { sessionService } from '../services/session.service.js';
+import { walletService } from '../services/wallet.service.js';
+import { transactionService } from '../services/transaction.service.js';
+import { prisma } from '../models/prisma.client.js';
+import { extractPhoneNumber, formatWhatsAppNumber, } from '../config/twilio.config.js';
+import { OnboardingStep, MainStep, Intent, } from '../types/index.js';
+import { sanitizeInput, getUserFriendlyErrorMessage, } from '../utils/index.js';
+import { getTokenDetails_DEXSCREENER, getTokenDetails_DEXTOOLS, getCustomTokenDataForEvmChainUsingUniSwapV30g, } from '../services/token.service.js';
+// ==================== UTILITY FUNCTIONS ====================
+/**
+ * Check if a string is a contract address
+ */
+function isContractAddress(input) {
+    const trimmed = input.trim();
+    // Solana address: 32-44 characters, base58
+    const isSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed);
+    // EVM address: 0x followed by 40 hex characters
+    const isEvm = /^0x[a-fA-F0-9]{40}$/.test(trimmed);
+    return isSolana || isEvm;
+}
+function extractContractAddressFromMessage(message) {
+    // Match Solana addresses (base58, 32-44 chars)
+    const solanaMatch = message.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
+    if (solanaMatch?.[0]) {
+        return solanaMatch[0];
+    }
+    // Match EVM addresses (0x + 40 hex chars)
+    const evmMatch = message.match(/\b0x[a-fA-F0-9]{40}\b/);
+    if (evmMatch?.[0]) {
+        return evmMatch[0];
+    }
+    return null;
+}
+// Add this function to detect buy/swap intent with context
+function detectBuyIntentWithAddress(message) {
+    const lower = message.toLowerCase();
+    const hasBuyIntent = /\b(buy|purchase|get|swap|trade)\b/.test(lower);
+    if (!hasBuyIntent)
+        return { intent: null, address: null };
+    const address = extractContractAddressFromMessage(message);
+    const intent = /\b(swap|trade|exchange)\b/.test(lower) ? 'swap' : 'buy';
+    return { intent, address };
+}
+/**
+ * Detect chain from contract address format
+ */
+function detectChainFromAddress(address) {
+    // Solana addresses are base58 encoded and typically 32-44 characters
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address.trim())) {
+        return 'solana';
+    }
+    // EVM addresses start with 0x
+    return 'evm';
+}
+/**
+ * Format large numbers for display
+ */
+function formatNumber(num) {
+    if (num >= 1e9)
+        return `${(num / 1e9).toFixed(2)}B`;
+    if (num >= 1e6)
+        return `${(num / 1e6).toFixed(2)}M`;
+    if (num >= 1e3)
+        return `${(num / 1e3).toFixed(2)}K`;
+    return num.toFixed(2);
+}
+export function isCasualMessage(message) {
+    const lower = message.toLowerCase().trim();
+    // Greetings and casual chat
+    const casualPhrases = [
+        'hi', 'hello', 'hey', 'sup', 'wassup', 'how are you', 'how\'re you',
+        'good morning', 'good afternoon', 'good evening', 'whats up',
+        'what\'s up', 'how you doing', 'how are you doing', 'how\'s it going',
+        'hows it going', 'yo', 'ola', 'hola'
+    ];
+    // Check if message is purely casual (not mixed with trading intent)
+    const words = lower.split(/\s+/);
+    // If message is short (1-5 words) and contains casual phrases
+    if (words.length <= 5) {
+        for (const phrase of casualPhrases) {
+            if (lower.includes(phrase)) {
+                // Make sure it's not mixed with trading keywords
+                const tradingKeywords = ['swap', 'buy', 'send', 'balance', 'address', 'trade'];
+                const hasTradingIntent = tradingKeywords.some(kw => lower.includes(kw));
+                if (!hasTradingIntent) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+function getNativeTokenSymbol(chain) {
+    const nativeTokens = {
+        'solana': 'SOL',
+        'ethereum': 'ETH',
+        'base': 'ETH',
+        'bsc': 'BNB',
+        '0g': '0G',
+        'polygon': 'MATIC'
+    };
+    return nativeTokens[chain.toLowerCase()] || 'tokens';
+}
+// ==================== MAIN WEBHOOK HANDLERS ====================
+async function checkBalanceAndGuide(userId, chain, amount, tokenSymbol) {
+    try {
+        const balance = await walletService.getWalletBalance(userId, chain);
+        const availableBalance = Number(balance.nativeBalance.formatted);
+        if (availableBalance === 0) {
+            // No balance at all - guide user to fund wallet
+            const wallet = await walletService.getUserWallet(userId, chain);
+            return {
+                hasBalance: false,
+                message: `❌ *Insufficient Balance*\n\n` +
+                    `You need ${tokenSymbol} to make this purchase, but your wallet is empty.\n\n` +
+                    `💰 *Fund Your Wallet:*\n` +
+                    `Send ${tokenSymbol} to this address:\n\n` +
+                    `\`${wallet.address}\`\n\n` +
+                    `Once funded, try again! 🚀`
+            };
+        }
+        if (amount > availableBalance) {
+            // Has some balance but not enough
+            const wallet = await walletService.getUserWallet(userId, chain);
+            return {
+                hasBalance: false,
+                message: `❌ *Insufficient Balance*\n\n` +
+                    `You have: ${availableBalance} ${tokenSymbol}\n` +
+                    `You need: ${amount} ${tokenSymbol}\n` +
+                    `Short by: ${(amount - availableBalance).toFixed(6)} ${tokenSymbol}\n\n` +
+                    `💰 *Options:*\n` +
+                    `1️⃣ Enter a smaller amount (max ${availableBalance} ${tokenSymbol})\n` +
+                    `2️⃣ Fund your wallet:\n\n` +
+                    `\`${wallet.address}\`\n\n` +
+                    `What would you like to do?`
+            };
+        }
+        return { hasBalance: true };
+    }
+    catch (error) {
+        console.error('Error checking balance:', error);
+        return {
+            hasBalance: false,
+            message: '❌ Could not verify your balance. Please try again.'
+        };
+    }
+}
+/**
+ * Main webhook handler - receives all incoming messages
+ */
+/**
+ * 🔥 FIXED: Main webhook handler - properly handles new vs returning users
+ */
+export async function handleIncomingMessage(req, res) {
+    const startTime = Date.now();
+    const payload = req.body;
+    // Extract data from webhook
+    const whatsappNumber = payload.From;
+    const phone = extractPhoneNumber(whatsappNumber);
+    const message = sanitizeInput(payload.Body);
+    const profileName = payload.ProfileName || null;
+    const messageSid = payload.MessageSid;
+    console.log(`\n📨 Message received from ${phone}: "${message.substring(0, 50)}..."`);
+    try {
+        // 🔥 FIX: Check user FIRST before touching
+        const existingUser = await prisma.user.findUnique({
+            where: { phone },
+            select: {
+                id: true,
+                onboardingStatus: true,
+                onboardingStep: true,
+                wallets: {
+                    select: { id: true }
+                }
+            }
+        });
+        let responseMessage;
+        // 🔥 SMART ROUTING: 
+        // 1. User doesn't exist → Start onboarding
+        // 2. User exists + COMPLETED → Main flow
+        // 3. User exists + IN_PROGRESS → Continue onboarding
+        if (!existingUser) {
+            console.log('🆕 New user detected - starting onboarding');
+            // Create user and start onboarding
+            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined);
+        }
+        else if (existingUser.onboardingStatus === 'COMPLETED' && existingUser.wallets.length > 0) {
+            console.log('✅ Returning user - main flow');
+            // Update last active
+            await prisma.touchUser(phone, profileName);
+            // Casual greeting for "Hi" messages
+            if (isCasualMessage(message)) {
+                const displayName = existingUser.onboardingStep || 'there';
+                responseMessage = `Hey! 👋 Welcome back! Need help with anything? Type "help" to see commands.`;
+            }
+            else {
+                // Route to main conversation flow
+                responseMessage = await handleMainFlow(phone, message);
+            }
+        }
+        else if (existingUser.onboardingStatus === 'IN_PROGRESS') {
+            console.log('🔄 User has incomplete onboarding - continuing');
+            // Update last active
+            await prisma.touchUser(phone, profileName);
+            // Continue onboarding from where they left off
+            responseMessage = await handleOnboardingFlow(phone, message, profileName || undefined);
+        }
+        else {
+            console.log('⚠️ User in weird state - restarting onboarding');
+            // User exists but in weird state - restart onboarding
+            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined);
+        }
+        // Send response via Twilio
+        await twilioService.sendMessage({
+            to: phone,
+            message: responseMessage,
+        });
+        // Log webhook for debugging
+        const processingTime = Date.now() - startTime;
+        await prisma.logWebhook({
+            phone,
+            message,
+            profileName,
+            messageSid,
+            responseStatus: 'success',
+            responseMessage: responseMessage.substring(0, 200),
+            processingTime,
+            errorDetails: null,
+        });
+        console.log(`✅ Response sent to ${phone} (${processingTime}ms)`);
+        // Respond to Twilio with 200 OK
+        res.status(200).send('OK');
+    }
+    catch (error) {
+        console.error('❌ Error handling webhook:', error);
+        // Log error
+        await prisma.logWebhook({
+            phone,
+            message,
+            profileName,
+            messageSid,
+            responseStatus: 'error',
+            responseMessage: null,
+            errorDetails: error instanceof Error ? error.message : 'Unknown error',
+            processingTime: Date.now() - startTime,
+        });
+        // Send user-friendly error message
+        const errorMessage = getUserFriendlyErrorMessage(error);
+        await twilioService
+            .sendMessage({ to: phone, message: errorMessage })
+            .catch((sendError) => {
+            console.error('Failed to send error message:', sendError);
+        });
+        // Still respond 200 to Twilio (prevent retries)
+        res.status(200).send('OK');
+    }
+}
+/**
+ * Handle onboarding flow for new users
+ */
+async function handleOnboardingFlow(phone, message, profileName) {
+    // Get current progress
+    const progress = await onboardingService.getProgress(phone);
+    // Check simple intents first (yes/no/cancel)
+    const simpleIntent = aiService.detectSimpleIntent(message);
+    switch (progress.step) {
+        case OnboardingStep.AWAITING_PIN_CHOICE:
+            // First step - User choosing whether to set up PIN
+            // This handles "yes" or "no" responses
+            return onboardingService.handlePinChoice(phone, message);
+        case OnboardingStep.AWAITING_PIN:
+            // User chose YES and is now creating PIN
+            return onboardingService.processPin(phone, message);
+        case OnboardingStep.CONFIRMING_PIN:
+            // User confirming PIN
+            return onboardingService.confirmPin(phone, message);
+        case OnboardingStep.DISPLAYING_SEED:
+            // Waiting for user to confirm they saved seed
+            if (simpleIntent === Intent.CONFIRM || message.toLowerCase() === 'saved' || message.toLowerCase().includes('saved')) {
+                return onboardingService.confirmSeedSaved(phone);
+            }
+            return `Please type "SAVED" once you've safely written down your recovery phrase. 📝\n\nThis is important - we can't recover it for you!`;
+        case OnboardingStep.COMPLETED:
+            // Already completed - redirect to main flow
+            return `Your wallet is already set up! 🎉\n\nType *"help"* to see what you can do.`;
+        default:
+            // New user or unrecognized step - start onboarding
+            return onboardingService.startOnboarding(phone, profileName);
+    }
+}
+/**
+ * Handle main conversation flow for onboarded users
+ */
+/**
+ * ⭐ FIXED: Handle main conversation flow with proper context
+ */
+async function handleMainFlow(phone, message) {
+    try {
+        const user = await prisma.user.findUnique({ where: { phone } });
+        if (!user) {
+            return 'User not found. Please start over by typing "start".';
+        }
+        // Convert user.id to string and ensure it's defined
+        const userId = String(user.id);
+        const session = await sessionService.getOrCreateSession(phone, MainStep.IDLE, userId);
+        // ⭐ Extract session context for AI
+        const sessionContext = {
+            currentStep: session.currentStep,
+            lastIntent: session.context?.lastIntent,
+            chain: session.context?.chain,
+            fromToken: session.context?.fromToken,
+            toToken: session.context?.toToken,
+            amount: session.context?.amount,
+            address: session.context?.address,
+            lastViewedToken: session.context?.lastViewedToken,
+        };
+        // ⭐ PRIORITY 1: Check for buy/swap intent WITH contract address in message
+        const buyIntent = detectBuyIntentWithAddress(message);
+        if (buyIntent.intent && buyIntent.address) {
+            console.log(`🎯 Detected ${buyIntent.intent} intent with address:`, buyIntent.address);
+            // Reset any ongoing flow
+            if (session.currentStep !== MainStep.IDLE) {
+                await sessionService.resetSession(phone, userId);
+            }
+            // Look up token and start buy flow
+            return await handleTokenLookup(phone, userId, buyIntent.address);
+        }
+        // ⭐ PRIORITY 2: Check if user wants to buy/swap the token they just viewed
+        const lastViewedToken = sessionContext.lastViewedToken;
+        if (lastViewedToken) {
+            const lower = message.toLowerCase().trim();
+            const buyKeywords = ['buy', 'purchase', 'get', 'swap', 'trade', 'yes', 'let\'s go', 'okay'];
+            // If they're in IDLE and say buy/swap keywords, start the flow
+            if (session.currentStep === MainStep.IDLE && buyKeywords.some(kw => lower.includes(kw))) {
+                console.log('🎯 User wants to buy lastViewedToken:', lastViewedToken.symbol);
+                return handleSwapTokens(phone, userId, {});
+            }
+        }
+        // ⭐ PRIORITY 3: Check for casual messages
+        if (isCasualMessage(message)) {
+            if (session.currentStep !== MainStep.IDLE) {
+                await sessionService.resetSession(phone, userId);
+            }
+            const displayName = user.name ?? 'there';
+            const casualResponses = [
+                `Hey ${displayName}! 👋 I'm doing great, thanks for asking! How can I help you with crypto today?`,
+                `Hello ${displayName}! 😊 All good here! What would you like to do?`,
+                `Hey! 👋 I'm here and ready to help! Need to check your balance, swap tokens, or something else?`,
+            ];
+            return casualResponses[Math.floor(Math.random() * casualResponses.length)];
+        }
+        // ⭐ PRIORITY 4: Check if message is JUST a contract address (no buy intent)
+        const trimmedMessage = message.trim();
+        if (isContractAddress(trimmedMessage)) {
+            if (session.currentStep !== MainStep.IDLE) {
+                await sessionService.resetSession(phone, userId);
+            }
+            return await handleTokenLookup(phone, userId, trimmedMessage);
+        }
+        // ⭐ PRIORITY 5: Check simple intents WITH session context
+        const simpleIntent = aiService.detectSimpleIntent(message, sessionContext);
+        if (simpleIntent) {
+            console.log('✅ Simple intent detected:', simpleIntent);
+            // Handle cancel
+            if (simpleIntent === Intent.CANCEL) {
+                await sessionService.resetSession(phone, userId);
+                return '❌ Action cancelled. What would you like to do? Type "help" for options.';
+            }
+            // Handle confirm in specific contexts
+            if (simpleIntent === Intent.CONFIRM) {
+                // This would be handled in flow step
+                if (session.currentStep !== MainStep.IDLE) {
+                    return handleFlowStep(phone, userId, message, session.currentStep, session.context);
+                }
+            }
+            // Handle swap intent
+            if (simpleIntent === Intent.SWAP_TOKENS && session.currentStep === MainStep.IDLE) {
+                if (lastViewedToken) {
+                    return handleSwapTokens(phone, userId, {});
+                }
+            }
+            return handleSimpleIntent(simpleIntent, phone, userId, session.currentStep);
+        }
+        // ⭐ PRIORITY 6: If in middle of a flow, handle step-by-step (SKIP AI)
+        if (session.currentStep !== MainStep.IDLE) {
+            console.log('📍 User in flow step:', session.currentStep);
+            return handleFlowStep(phone, userId, message, session.currentStep, session.context);
+        }
+        // ⭐ PRIORITY 7: Use AI for complex queries WITH full context
+        console.log('🤖 Analyzing message with AI (with context)...');
+        const safeUserName = user.name ?? 'User';
+        // ⭐ Pass session context to AI
+        const aiResponse = await aiService.analyzeMessage(message, {
+            userName: safeUserName,
+            sessionContext: sessionContext, // ⭐ THIS IS THE FIX
+            lastViewedToken: lastViewedToken,
+            conversationHistory: [
+                {
+                    role: 'system',
+                    content: `User's name is ${safeUserName}. ${lastViewedToken ? `User just viewed token: ${lastViewedToken.symbol} (${lastViewedToken.name}) on ${lastViewedToken.chain}` : ''}`,
+                },
+            ],
+        });
+        console.log(`✅ AI detected intent: ${aiResponse.intent} (confidence: ${aiResponse.confidence})`);
+        if (typeof aiResponse.confidence !== 'number' || aiResponse.confidence < 0.4 || aiResponse.intent === Intent.UNKNOWN) {
+            return aiResponse.response ?? getHelpMessage();
+        }
+        const safeAiResponseText = aiResponse.response ?? '';
+        const safeEntities = aiResponse.entities ?? {};
+        return routeByIntent(aiResponse.intent, phone, userId, safeEntities, safeAiResponseText);
+    }
+    catch (error) {
+        console.error('❌ Error in main flow:', error);
+        return "I'm having trouble processing that right now. Type 'help' to see what I can do!";
+    }
+}
+// ==================== TOKEN LOOKUP HANDLER ====================
+/**
+ * Handle token lookup when user pastes contract address
+ */
+async function handleTokenLookup(phone, userId, contractAddress) {
+    try {
+        console.log('🔍 Looking up token:', contractAddress);
+        const chainType = detectChainFromAddress(contractAddress);
+        console.log('Detected chain type:', chainType);
+        let tokenDetails = null;
+        let userWallet = null;
+        let specificChain = 'ethereum';
+        if (chainType === 'solana') {
+            tokenDetails = await getTokenDetails_DEXSCREENER(contractAddress);
+            if (!tokenDetails) {
+                tokenDetails = await getTokenDetails_DEXTOOLS(contractAddress);
+            }
+            specificChain = 'solana';
+            userWallet = await walletService.getUserWallet(userId, 'solana');
+        }
+        else {
+            tokenDetails = await getTokenDetails_DEXSCREENER(contractAddress);
+            if (!tokenDetails) {
+                tokenDetails = await getTokenDetails_DEXTOOLS(contractAddress);
+            }
+            if (!tokenDetails) {
+                const chains = await walletService.getUserWallets(userId);
+                const zeroGChain = chains.find(w => w.chainKey === '0g');
+                if (zeroGChain) {
+                    console.log('Trying 0G chain lookup...');
+                    tokenDetails = await getCustomTokenDataForEvmChainUsingUniSwapV30g(contractAddress, {
+                        name: '0g',
+                        rpcUrl: process.env.ZEROG_RPC_URL || 'https://evmrpc.0g.ai',
+                    });
+                    if (tokenDetails) {
+                        specificChain = '0g';
+                    }
+                }
+            }
+            if (tokenDetails) {
+                const chainKey = tokenDetails.chain.toLowerCase();
+                const chainMap = {
+                    'ethereum': 'ethereum',
+                    'eth': 'ethereum',
+                    'base': 'base',
+                    'bsc': 'bsc',
+                    'bnb': 'bsc',
+                    '0g': '0g',
+                    'polygon': 'polygon',
+                };
+                specificChain = chainMap[chainKey] || specificChain;
+            }
+            userWallet = await walletService.getUserWallet(userId, specificChain);
+        }
+        if (!tokenDetails) {
+            return `❌ Could not find token information for this address.\n\n` +
+                `Make sure you're using the correct contract address for ${chainType === 'solana' ? 'Solana' : 'BSC/Ethereum/Base'}.\n\n` +
+                `Try again or type "help" for assistance.`;
+        }
+        // ⭐ Store in session
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.IDLE,
+            context: {
+                lastViewedToken: {
+                    address: contractAddress,
+                    symbol: tokenDetails.symbol,
+                    name: tokenDetails.name,
+                    chain: specificChain,
+                    priceUsd: tokenDetails.priceUsd,
+                }
+            }
+        });
+        // Format message
+        let message = `✨ Found it!\n\n`;
+        message += `🪙 *${tokenDetails.name}* (${tokenDetails.symbol})\n\n`;
+        message += `💰 Price: $${tokenDetails.priceUsd.toFixed(6)}\n`;
+        message += `📊 Market Cap: $${formatNumber(tokenDetails.mc)}\n`;
+        message += `💧 Liquidity: $${formatNumber(tokenDetails.liquidityInUsd)}\n`;
+        message += `⛓️ Chain: ${specificChain.toUpperCase()}\n\n`;
+        if (tokenDetails.change) {
+            message += `📈 Price Changes:\n`;
+            if (tokenDetails.change.m5) {
+                message += `5m: ${tokenDetails.change.m5 > 0 ? '+' : ''}${tokenDetails.change.m5.toFixed(2)}%\n`;
+            }
+            if (tokenDetails.change.h1) {
+                message += `1h: ${tokenDetails.change.h1 > 0 ? '+' : ''}${tokenDetails.change.h1.toFixed(2)}%\n`;
+            }
+            if (tokenDetails.change.h24) {
+                message += `24h: ${tokenDetails.change.h24 > 0 ? '+' : ''}${tokenDetails.change.h24.toFixed(2)}%\n`;
+            }
+            message += `\n`;
+        }
+        if (tokenDetails.volume) {
+            message += `📊 Volume:\n`;
+            if (tokenDetails.volume.h24) {
+                message += `24h: $${formatNumber(tokenDetails.volume.h24)}\n`;
+            }
+            message += `\n`;
+        }
+        const socials = [];
+        if (tokenDetails.websiteUrl)
+            socials.push(`🌐 Website`);
+        if (tokenDetails.twitterUrl)
+            socials.push(`🐦 Twitter`);
+        if (tokenDetails.telegramUrl)
+            socials.push(`💬 Telegram`);
+        if (socials.length > 0) {
+            message += `${socials.join(' | ')}\n\n`;
+        }
+        // Get user's balance
+        const nativeToken = getNativeTokenSymbol(specificChain);
+        let balanceFormatted = 0;
+        try {
+            const balance = await walletService.getWalletBalance(userId, specificChain);
+            balanceFormatted = balance.nativeBalance.formatted;
+            const balanceNum = Number(balanceFormatted);
+            message += `💰 Your ${nativeToken} balance: ${balanceFormatted}\n\n`;
+            // ⭐ SMART GUIDANCE based on balance
+            if (balanceNum === 0) {
+                message += `⚠️ *Wallet Empty*\n\n`;
+                message += `To buy ${tokenDetails.symbol}, you need ${nativeToken}.\n\n`;
+                message += `📥 *Fund your wallet:*\n`;
+                message += `\`${userWallet.address}\`\n\n`;
+                message += `Send ${nativeToken} to this address, then come back to buy!`;
+            }
+            else {
+                message += `🚀 *Ready to buy ${tokenDetails.symbol}?*\n`;
+                message += `Just reply with how much ${nativeToken} you want to spend!\n\n`;
+                message += `_Example: 0.1 or 1.5_\n`;
+                message += `_Max: ${balanceFormatted} ${nativeToken}_`;
+            }
+        }
+        catch (error) {
+            console.error('Error fetching balance:', error);
+            message += `🚀 *Want to buy ${tokenDetails.symbol}?*\n`;
+            message += `Just reply with how much ${nativeToken} you want to spend!\n\n`;
+            message += `_Example: 0.1 or 1.5_`;
+        }
+        return message;
+    }
+    catch (error) {
+        console.error('Error in token lookup:', error);
+        return `❌ Could not fetch token information. Please try again later.`;
+    }
+}
+// ==================== INTENT HANDLERS ====================
+/**
+ * Handle simple intents (help, confirm, cancel)
+ */
+function handleSimpleIntent(intent, phone, userId, currentStep) {
+    switch (intent) {
+        case Intent.HELP:
+            // For simple help keyword, show full help menu
+            return getHelpMessage();
+        case Intent.CONFIRM:
+            // Handle based on current step
+            return 'Please specify what you want to confirm.';
+        case Intent.CANCEL:
+            // Cancel current flow
+            sessionService.resetSession(phone, userId);
+            return '❌ Action cancelled. Type "help" to see available options.';
+        default:
+            return 'How can I help you? Type "help" to see options.';
+    }
+}
+/**
+ * Handle step-by-step flow navigation
+ */
+async function handleFlowStep(phone, userId, message, currentStep, context) {
+    try {
+        switch (currentStep) {
+            // Send crypto flow
+            case MainStep.SEND_CRYPTO_CHAIN:
+                return await handleSendChainStep(phone, userId, message, context);
+            case MainStep.SEND_CRYPTO_ADDRESS:
+                return await handleSendAddressStep(phone, userId, message, context);
+            case MainStep.SEND_CRYPTO_AMOUNT:
+                return await handleSendAmountStep(phone, userId, message, context);
+            case MainStep.SEND_CRYPTO_CONFIRM:
+                return await handleSendConfirmStep(phone, userId, message, context);
+            case MainStep.SEND_CRYPTO_PIN:
+                return await handleSendPinStep(phone, userId, message, context);
+            // Swap flow
+            case MainStep.SWAP_TOKENS_CHAIN:
+                return await handleSwapChainStep(phone, userId, message, context);
+            case MainStep.SWAP_TOKENS_FROM:
+                return await handleSwapFromTokenStep(phone, userId, message, context);
+            case MainStep.SWAP_TOKENS_TO:
+                return await handleSwapToTokenStep(phone, userId, message, context);
+            case MainStep.SWAP_TOKENS_AMOUNT:
+                return await handleSwapAmountStep(phone, userId, message, context);
+            case MainStep.SWAP_TOKENS_CONFIRM:
+                return await handleSwapConfirmStep(phone, userId, message, context);
+            case MainStep.SWAP_TOKENS_PIN:
+                return await handleSwapPinStep(phone, userId, message, context);
+            default:
+                // Reset to idle if unknown step
+                await sessionService.resetSession(phone, userId);
+                return 'Something went wrong. Type "help" to see what I can do!';
+        }
+    }
+    catch (error) {
+        console.error('Error in flow step:', error);
+        await sessionService.resetSession(phone, userId);
+        return 'An error occurred. Please start over. Type "help" for options.';
+    }
+}
+/**
+ * Route by AI-detected intent
+ */
+async function routeByIntent(intent, phone, userId, entities, aiResponse) {
+    try {
+        switch (intent) {
+            case Intent.CHECK_BALANCE:
+                return handleCheckBalance(userId, entities.chain);
+            case Intent.VIEW_ADDRESS:
+                return handleViewAddress(userId, entities.chain);
+            case Intent.SEND_CRYPTO:
+                return handleSendCrypto(phone, userId, entities);
+            case Intent.RECEIVE_CRYPTO:
+                return handleReceiveCrypto(userId, entities.chain);
+            case Intent.SWAP_TOKENS:
+                return handleSwapTokens(phone, userId, entities);
+            case Intent.TRANSACTION_HISTORY:
+                return handleTransactionHistory(userId, entities.chain);
+            case Intent.SETTINGS:
+                return handleSettings(userId);
+            case Intent.HELP:
+                // Use AI's custom response if available, otherwise use default
+                return aiResponse || getHelpMessage();
+            default:
+                return aiResponse || "I didn't quite understand that. Type 'help' to see what I can do!";
+        }
+    }
+    catch (error) {
+        console.error(`❌ Error routing intent ${intent}:`, error);
+        return "Something went wrong. Type 'help' to see what I can do!";
+    }
+}
+/**
+ * Handle check balance intent
+ */
+async function handleCheckBalance(userId, chain) {
+    try {
+        if (chain) {
+            // Get balance for specific chain
+            const balance = await walletService.getWalletBalance(userId, chain);
+            return `🟣 ${balance.chainName}\n\nAddress: ${balance.address}\n\nBalance: ${balance.nativeBalance.formatted} ${balance.nativeSymbol}`;
+        }
+        // Get all balances
+        const balances = await walletService.getAllBalances(userId);
+        let response = '💰 Your Wallet Balances:\n\n';
+        for (const bal of balances) {
+            response += `${bal.chainKey === 'solana' ? '🟣' : '🔵'} ${bal.chainName}: ${bal.nativeBalance.formatted} ${bal.nativeSymbol}\n`;
+        }
+        response += '\nType "send" to transfer funds or "swap" to exchange tokens.';
+        return response;
+    }
+    catch (error) {
+        console.error('Error checking balance:', error);
+        return 'Sorry, I could not fetch your balance right now. Please try again.';
+    }
+}
+/**
+ * Handle view address intent
+ */
+async function handleViewAddress(userId, chain) {
+    try {
+        if (chain) {
+            const wallet = await walletService.getUserWallet(userId, chain);
+            return `${chain === 'solana' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()} Address:\n\n${wallet.address}\n\nShare this address to receive crypto.`;
+        }
+        const wallets = await walletService.getUserWallets(userId);
+        let response = '📬 Your Wallet Addresses:\n\n';
+        for (const wallet of wallets) {
+            response += `${wallet.chain === 'SVM' ? '🟣' : '🔵'} ${wallet.chainKey.toUpperCase()}:\n${wallet.address}\n\n`;
+        }
+        return response;
+    }
+    catch (error) {
+        console.error('Error viewing address:', error);
+        return 'Sorry, I could not fetch your address right now. Please try again.';
+    }
+}
+/**
+ * Handle send crypto intent
+ */
+async function handleSendCrypto(phone, userId, entities) {
+    try {
+        // If all required info is provided, execute immediately
+        if (entities.chain && entities.address && entities.amount) {
+            return await executeSendTransaction(userId, entities);
+        }
+        // Start send flow if partial info
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.SEND_CRYPTO_CHAIN,
+            context: entities,
+        });
+        if (!entities.chain) {
+            return 'Which chain would you like to send from?\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n⚫ 0G';
+        }
+        if (!entities.address) {
+            return `Please provide the recipient's address on ${entities.chain}.`;
+        }
+        if (!entities.amount) {
+            return `How much would you like to send?`;
+        }
+        return 'Please provide: chain, address, and amount to send.';
+    }
+    catch (error) {
+        console.error('Error initiating send:', error);
+        return 'Failed to initiate send. Please try again with: send [amount] [token] to [address] on [chain]';
+    }
+}
+/**
+ * Handle receive crypto intent
+ */
+async function handleReceiveCrypto(userId, chain) {
+    return handleViewAddress(userId, chain);
+}
+/**
+ * Handle swap tokens intent
+ */
+async function handleSwapTokens(phone, userId, entities) {
+    try {
+        const session = await sessionService.getOrCreateSession(phone, MainStep.IDLE, userId);
+        const lastViewedToken = session.context?.lastViewedToken;
+        // ⭐ If user just viewed a token and says "buy/swap"
+        if (lastViewedToken && !entities.fromToken && !entities.toToken) {
+            const chain = lastViewedToken.chain;
+            const nativeToken = getNativeTokenSymbol(chain);
+            // Pre-fill the TO token (what they want to buy)
+            await sessionService.updateSession(phone, {
+                currentStep: MainStep.SWAP_TOKENS_FROM,
+                context: {
+                    ...(session.context ?? {}),
+                    chain: chain,
+                    toToken: lastViewedToken.symbol,
+                    toTokenAddress: lastViewedToken.address,
+                    toTokenName: lastViewedToken.name,
+                    toTokenSymbol: lastViewedToken.symbol,
+                    lastViewedToken,
+                },
+            });
+            // Get user's balance
+            try {
+                const balance = await walletService.getWalletBalance(userId, chain);
+                // ⭐ CONVERSATIONAL: Ask about native token by default
+                return `Alright! Let's get you some *${lastViewedToken.symbol}*! 🚀\n\n` +
+                    `How much *${nativeToken}* do you want to swap?\n\n` +
+                    `💰 Your ${nativeToken} balance: ${balance.nativeBalance.formatted}\n\n` +
+                    `Just reply with an amount like: 0.1 or 1.5\n\n` +
+                    `_Or type the token symbol if you want to swap something else (USDC, USDT, etc.)_`;
+            }
+            catch (error) {
+                console.error('Error fetching balance:', error);
+                return `Alright! Let's get you some *${lastViewedToken.symbol}*! 🚀\n\n` +
+                    `How much *${nativeToken}* do you want to swap?\n\n` +
+                    `Just reply with an amount like: 0.1 or 1.5\n\n` +
+                    `_Or type the token symbol if you want to swap something else_`;
+            }
+        }
+        // If all required info provided, execute
+        if (entities.chain && entities.fromToken && entities.toToken && entities.amount) {
+            return await executeSwapTransaction(userId, entities);
+        }
+        // Start guided flow
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.SWAP_TOKENS_CHAIN,
+            context: {
+                ...(session.context ?? {}),
+                ...entities,
+            },
+        });
+        if (!entities.chain) {
+            return 'Which blockchain would you like to swap on?\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n\nJust reply with the name!';
+        }
+        if (!entities.fromToken || !entities.toToken) {
+            return `Which tokens would you like to swap?\n\nFor example: "1 SOL for USDC" or "swap ETH to USDC"`;
+        }
+        if (!entities.amount) {
+            return `How much ${entities.fromToken} would you like to swap?`;
+        }
+        return 'To swap, I need: chain, tokens, and amount.\n\nTry: "swap 1 SOL for USDC on Solana"';
+    }
+    catch (error) {
+        console.error('Error initiating swap:', error);
+        return 'Failed to start swap. Please try again or type "help"!';
+    }
+}
+/**
+ * Handle transaction history intent
+ */
+async function handleTransactionHistory(userId, chain) {
+    try {
+        const transactions = await transactionService.getTransactionHistory(userId, {
+            chainKey: chain,
+            limit: 10,
+        });
+        if (transactions.length === 0) {
+            return "You don't have any transactions yet.";
+        }
+        let response = '📜 Recent Transactions:\n\n';
+        for (const tx of transactions.slice(0, 5)) {
+            response += `${tx.type} - ${tx.amount} ${tx.tokenSymbol || tx.chainKey}\n`;
+            response += `Status: ${tx.status}\n`;
+            response += `${new Date(tx.createdAt).toLocaleDateString()}\n\n`;
+        }
+        return response;
+    }
+    catch (error) {
+        console.error('Error fetching transactions:', error);
+        return 'Sorry, I could not fetch your transaction history right now.';
+    }
+}
+/**
+ * Handle settings intent
+ */
+async function handleSettings(userId) {
+    return '⚙️ Settings:\n\n1. Change PIN\n2. Security settings\n3. Export seed phrase\n\nReply with a number to continue.';
+}
+// ==================== SEND FLOW HANDLERS ====================
+/**
+ * Handle chain selection for send
+ */
+async function handleSendChainStep(phone, userId, message, context) {
+    const chain = message.toLowerCase().trim();
+    const validChains = ['solana', 'ethereum', 'base', 'bsc', '0g'];
+    if (!validChains.includes(chain)) {
+        return 'Please select a valid chain:\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC\n⚫ 0G';
+    }
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SEND_CRYPTO_ADDRESS,
+        context: { ...context, chain },
+    });
+    return `Great! What's the recipient's ${chain} address?`;
+}
+/**
+ * Handle address input for send
+ */
+async function handleSendAddressStep(phone, userId, message, context) {
+    const address = message.trim();
+    // Basic validation (detailed validation happens in transaction service)
+    if (address.length < 20) {
+        return 'That doesn\'t look like a valid address. Please provide a valid address.';
+    }
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SEND_CRYPTO_AMOUNT,
+        context: { ...context, address },
+    });
+    return 'How much would you like to send? (e.g., 0.5 or 1.5)';
+}
+/**
+ * Handle amount input for send
+ */
+async function handleSendAmountStep(phone, userId, message, context) {
+    const amount = parseFloat(message.trim());
+    if (isNaN(amount) || amount <= 0) {
+        return 'Please enter a valid amount (e.g., 0.5 or 1.5)';
+    }
+    const { chain, address, tokenAddress } = context;
+    const tokenSymbol = context.tokenSymbol || (chain === 'solana' ? 'SOL' : 'ETH');
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SEND_CRYPTO_CONFIRM,
+        context: { ...context, amount },
+    });
+    return `📤 Send Summary:\n\n` +
+        `Amount: ${amount} ${tokenSymbol}\n` +
+        `To: ${address.substring(0, 10)}...${address.substring(address.length - 8)}\n` +
+        `Chain: ${chain}\n\n` +
+        `Reply "confirm" to proceed or "cancel" to abort.`;
+}
+/**
+ * Handle confirmation for send
+ */
+async function handleSendConfirmStep(phone, userId, message, context) {
+    const response = message.toLowerCase().trim();
+    if (response === 'cancel') {
+        await sessionService.resetSession(phone, userId);
+        return '❌ Transaction cancelled.';
+    }
+    if (response !== 'confirm' && response !== 'yes') {
+        return 'Please reply "confirm" to proceed or "cancel" to abort.';
+    }
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SEND_CRYPTO_PIN,
+        context,
+    });
+    return '🔐 Please enter your PIN to authorize the transaction:';
+}
+/**
+ * Handle PIN and execute send
+ */
+async function handleSendPinStep(phone, userId, message, context) {
+    const pin = message.trim();
+    try {
+        // Execute transaction
+        const result = await executeSendTransaction(userId, { ...context, pin });
+        // Reset session
+        await sessionService.resetSession(phone, userId);
+        return result;
+    }
+    catch (error) {
+        console.error('Send transaction failed:', error);
+        await sessionService.resetSession(phone, userId);
+        return `❌ Transaction failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    }
+}
+/**
+ * Execute send transaction
+ */
+async function executeSendTransaction(userId, params) {
+    try {
+        let transaction;
+        // Determine chain type (SVM or EVM)
+        const chainType = params.chain === 'solana' ? 'SVM' : 'EVM';
+        if (params.tokenAddress) {
+            // Send token
+            transaction = await transactionService.sendToken({
+                userId,
+                chain: chainType,
+                chainKey: params.chain,
+                toAddress: params.address,
+                amount: params.amount,
+                tokenAddress: params.tokenAddress,
+                pin: params.pin,
+                note: params.note,
+            });
+        }
+        else {
+            // Send native token
+            transaction = await transactionService.sendNative({
+                userId,
+                chain: chainType,
+                chainKey: params.chain,
+                toAddress: params.address,
+                amount: params.amount,
+                pin: params.pin,
+                note: params.note,
+            });
+        }
+        return `✅ Transaction Sent!\n\n` +
+            `Amount: ${transaction.amount} ${transaction.tokenSymbol}\n` +
+            `To: ${transaction.toAddress?.substring(0, 10)}...${transaction.toAddress?.substring(transaction.toAddress.length - 8)}\n` +
+            `Hash: ${transaction.hash.substring(0, 20)}...\n` +
+            `Status: ${transaction.status}\n\n` +
+            `Your transaction is being processed!`;
+    }
+    catch (error) {
+        throw error;
+    }
+}
+// ==================== SWAP FLOW HANDLERS ====================
+/**
+ * Handle chain selection for swap
+ */
+async function handleSwapChainStep(phone, userId, message, context) {
+    const chain = message.toLowerCase().trim();
+    const validChains = ['solana', 'ethereum', 'base', 'bsc'];
+    if (!validChains.includes(chain)) {
+        return 'Please select a valid chain:\n\n🟣 Solana\n🔵 Ethereum\n🔵 Base\n🟡 BSC';
+    }
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SWAP_TOKENS_FROM,
+        context: { ...context, chain },
+    });
+    return `What token would you like to swap from? (e.g., SOL, USDC, ETH)`;
+}
+/**
+ * Handle from token selection
+ */
+async function handleSwapFromTokenStep(phone, userId, message, context) {
+    const trimmed = message.trim();
+    const chain = context.chain || 'solana';
+    const nativeToken = getNativeTokenSymbol(chain);
+    // ⭐ SMART: If they just enter a number, assume native token
+    const amount = parseFloat(trimmed);
+    if (!isNaN(amount) && amount > 0) {
+        const fromToken = nativeToken;
+        // ⭐ CHECK BALANCE IMMEDIATELY
+        const balanceCheck = await checkBalanceAndGuide(userId, chain, amount, nativeToken);
+        if (!balanceCheck.hasBalance) {
+            // Don't move to next step - stay here and show guidance
+            return balanceCheck.message || '❌ Insufficient balance';
+        }
+        // They have enough - proceed
+        const toTokenDisplay = context.toTokenSymbol || context.toToken;
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.SWAP_TOKENS_CONFIRM,
+            context: { ...context, fromToken, amount },
+        });
+        return `🔄 *Swap Summary:*\n\n` +
+            `Swap: ${amount} ${fromToken} → ${toTokenDisplay}\n` +
+            `Token: ${context.toTokenName || toTokenDisplay}\n` +
+            `Chain: ${chain.toUpperCase()}\n` +
+            `Slippage: 1.5%\n\n` +
+            `Reply *"confirm"* to proceed or *"cancel"* to abort.`;
+    }
+    // They entered a token symbol
+    const fromToken = trimmed.toUpperCase();
+    try {
+        const balance = await walletService.getWalletBalance(userId, chain);
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.SWAP_TOKENS_AMOUNT,
+            context: { ...context, fromToken },
+        });
+        const toTokenDisplay = context.toTokenSymbol || context.toToken;
+        let balanceInfo = '';
+        if (fromToken === balance.nativeSymbol) {
+            const balanceNum = Number(balance.nativeBalance.formatted);
+            balanceInfo = `\n\n💰 Your ${fromToken} balance: ${balance.nativeBalance.formatted}`;
+            // ⭐ Warn if balance is zero
+            if (balanceNum === 0) {
+                const wallet = await walletService.getUserWallet(userId, chain);
+                return `⚠️ *No ${fromToken} Balance*\n\n` +
+                    `You need ${fromToken} to buy ${toTokenDisplay}.\n\n` +
+                    `📥 *Fund your wallet:*\n` +
+                    `\`${wallet.address}\`\n\n` +
+                    `Once funded, type the amount you want to swap!`;
+            }
+        }
+        return `Perfect! How much *${fromToken}* do you want to swap for *${toTokenDisplay}*?${balanceInfo}\n\nJust enter the amount (e.g., 0.1 or 1.5):`;
+    }
+    catch (error) {
+        console.error('Error fetching balance:', error);
+        await sessionService.updateSession(phone, {
+            currentStep: MainStep.SWAP_TOKENS_AMOUNT,
+            context: { ...context, fromToken },
+        });
+        const toTokenDisplay = context.toTokenSymbol || context.toToken;
+        return `Got it! How much *${fromToken}* do you want to swap for *${toTokenDisplay}*?\n\nJust enter the amount (e.g., 0.1 or 1.5):`;
+    }
+}
+/**
+ * Handle to token selection
+ */
+async function handleSwapToTokenStep(phone, userId, message, context) {
+    const toToken = message.trim().toUpperCase();
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SWAP_TOKENS_AMOUNT,
+        context: { ...context, toToken },
+    });
+    return `How much ${context.fromToken} would you like to swap?`;
+}
+/**
+ * Handle amount for swap
+ */
+async function handleSwapAmountStep(phone, userId, message, context) {
+    const amount = parseFloat(message.trim());
+    if (isNaN(amount) || amount <= 0) {
+        return '❌ Please enter a valid amount!\n\nFor example: 0.1 or 1.5';
+    }
+    // ⭐ CHECK BALANCE with helpful guidance
+    const chain = context.chain || 'solana';
+    const fromToken = context.fromToken;
+    const balanceCheck = await checkBalanceAndGuide(userId, chain, amount, fromToken);
+    if (!balanceCheck.hasBalance) {
+        // Stay in same step - don't proceed
+        return balanceCheck.message || '❌ Insufficient balance';
+    }
+    // Balance is sufficient - proceed to confirmation
+    const toTokenDisplay = context.toTokenSymbol || context.toToken;
+    const toTokenName = context.toTokenName || toTokenDisplay;
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SWAP_TOKENS_CONFIRM,
+        context: { ...context, amount },
+    });
+    return `🔄 *Swap Summary:*\n\n` +
+        `Swap: ${amount} ${context.fromToken} → ${toTokenDisplay}\n` +
+        `Token: ${toTokenName}\n` +
+        `Chain: ${context.chain.toUpperCase()}\n` +
+        `Slippage: 1.5%\n\n` +
+        `Reply *"confirm"* to proceed or *"cancel"* to abort.`;
+}
+/**
+ * Handle swap confirmation
+ */
+async function handleSwapConfirmStep(phone, userId, message, context) {
+    const response = message.toLowerCase().trim();
+    if (response === 'cancel') {
+        await sessionService.resetSession(phone, userId);
+        return '❌ Swap cancelled.';
+    }
+    if (response !== 'confirm' && response !== 'yes') {
+        return 'Please reply "confirm" to proceed or "cancel" to abort.';
+    }
+    await sessionService.updateSession(phone, {
+        currentStep: MainStep.SWAP_TOKENS_PIN,
+        context,
+    });
+    return '🔐 Please enter your PIN to authorize the swap:';
+}
+/**
+ * Handle PIN and execute swap
+ */
+async function handleSwapPinStep(phone, userId, message, context) {
+    const pin = message.trim();
+    try {
+        // Execute swap
+        const result = await executeSwapTransaction(userId, { ...context, pin });
+        // Reset session
+        await sessionService.resetSession(phone, userId);
+        return result;
+    }
+    catch (error) {
+        console.error('Swap transaction failed:', error);
+        await sessionService.resetSession(phone, userId);
+        return `❌ Swap failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    }
+}
+/**
+ * Execute swap transaction
+ */
+async function executeSwapTransaction(userId, params) {
+    try {
+        // Determine chain type (SVM or EVM)
+        const chainType = params.chain === 'solana' ? 'SVM' : 'EVM';
+        // Note: Token addresses need to be resolved from symbols
+        // This is a simplified version - you'd need a token registry
+        const fromTokenInfo = {
+            address: params.fromToken === 'SOL' ? 'native' : params.fromToken,
+            symbol: params.fromToken,
+            decimals: 9,
+        };
+        const toTokenInfo = {
+            address: params.toToken,
+            symbol: params.toToken,
+            decimals: 9,
+        };
+        const transaction = await transactionService.swap({
+            userId,
+            chain: chainType,
+            chainKey: params.chain,
+            fromToken: fromTokenInfo,
+            toToken: toTokenInfo,
+            amount: params.amount,
+            slippage: params.slippage || 150,
+            pin: params.pin,
+        });
+        return `✅ Swap Complete!\n\n` +
+            `Swapped: ${transaction.amount} ${params.fromToken} → ${params.toToken}\n` +
+            `Hash: ${transaction.hash.substring(0, 20)}...\n` +
+            `Status: ${transaction.status}\n\n` +
+            `Your swap is being processed!`;
+    }
+    catch (error) {
+        throw error;
+    }
+}
+/**
+ * Get help message
+ */
+function getHelpMessage() {
+    return `🤖 Here's what I can do:\n\n💰 Check Balance - "balance" or "how much SOL do I have?"\n\n📤 Send Crypto - "send 0.5 SOL to [address]"\n\n📥 Receive - "show my address" or "receive"\n\n🔄 Swap - "swap ETH for USDC"\n\n📜 History - "show transactions"\n\n⚙️ Settings - "settings"\n\n🪙 Token Info - Paste any contract address\n\nJust chat naturally! I'll understand. 😊`;
+}
+/**
+ * Handle message status updates (optional)
+ */
+export async function handleMessageStatus(req, res) {
+    const { MessageSid, MessageStatus } = req.body;
+    console.log(`📊 Message ${MessageSid} status: ${MessageStatus}`);
+    // You can track message delivery here if needed
+    // For now, just acknowledge
+    res.status(200).send('OK');
+}
+//# sourceMappingURL=webhook.controller.js.map

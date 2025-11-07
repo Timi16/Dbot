@@ -394,6 +394,9 @@ async function handleOnboardingFlow(
 /**
  * Handle main conversation flow for onboarded users
  */
+/**
+ * ⭐ FIXED: Handle main conversation flow with proper context
+ */
 async function handleMainFlow(phone: string, message: string): Promise<string> {
     try {
         const user = await prisma.user.findUnique({ where: { phone } });
@@ -402,12 +405,26 @@ async function handleMainFlow(phone: string, message: string): Promise<string> {
             return 'User not found. Please start over by typing "start".';
         }
 
+        // Convert user.id to string and ensure it's defined
         const userId = String(user.id);
+        
         const session = await sessionService.getOrCreateSession(
             phone,
             MainStep.IDLE,
             userId
         );
+
+        // ⭐ Extract session context for AI
+        const sessionContext = {
+            currentStep: session.currentStep,
+            lastIntent: (session.context as any)?.lastIntent,
+            chain: (session.context as any)?.chain,
+            fromToken: (session.context as any)?.fromToken,
+            toToken: (session.context as any)?.toToken,
+            amount: (session.context as any)?.amount,
+            address: (session.context as any)?.address,
+            lastViewedToken: (session.context as any)?.lastViewedToken,
+        }
 
         // ⭐ PRIORITY 1: Check for buy/swap intent WITH contract address in message
         const buyIntent = detectBuyIntentWithAddress(message)
@@ -424,7 +441,7 @@ async function handleMainFlow(phone: string, message: string): Promise<string> {
         }
 
         // ⭐ PRIORITY 2: Check if user wants to buy/swap the token they just viewed
-        const lastViewedToken = (session.context as SessionContext)?.lastViewedToken
+        const lastViewedToken = sessionContext.lastViewedToken
         if (lastViewedToken) {
             const lower = message.toLowerCase().trim()
             const buyKeywords = ['buy', 'purchase', 'get', 'swap', 'trade', 'yes', 'let\'s go', 'okay']
@@ -442,14 +459,14 @@ async function handleMainFlow(phone: string, message: string): Promise<string> {
                 await sessionService.resetSession(phone, userId);
             }
 
-            const displayName = user.name ?? 'there';
-            const casualResponses = [
+            const displayName: string = user.name ?? 'there';
+            const casualResponses: string[] = [
                 `Hey ${displayName}! 👋 I'm doing great, thanks for asking! How can I help you with crypto today?`,
                 `Hello ${displayName}! 😊 All good here! What would you like to do?`,
                 `Hey! 👋 I'm here and ready to help! Need to check your balance, swap tokens, or something else?`,
             ];
 
-            return casualResponses[Math.floor(Math.random() * casualResponses.length)];
+            casualResponses[Math.floor(Math.random() * casualResponses.length)];
         }
 
         // ⭐ PRIORITY 4: Check if message is JUST a contract address (no buy intent)
@@ -461,34 +478,55 @@ async function handleMainFlow(phone: string, message: string): Promise<string> {
             return await handleTokenLookup(phone, userId, trimmedMessage);
         }
 
-        // Check simple trading intents
-        const simpleIntent = await aiService.detectSimpleIntent(message);
+        // ⭐ PRIORITY 5: Check simple intents WITH session context
+        const simpleIntent = aiService.detectSimpleIntent(message, sessionContext);
         if (simpleIntent) {
+            console.log('✅ Simple intent detected:', simpleIntent)
+
+            // Handle cancel
+            if (simpleIntent === Intent.CANCEL) {
+                await sessionService.resetSession(phone, userId)
+                return '❌ Action cancelled. What would you like to do? Type "help" for options.'
+            }
+
+            // Handle confirm in specific contexts
+            if (simpleIntent === Intent.CONFIRM) {
+                // This would be handled in flow step
+                if (session.currentStep !== MainStep.IDLE) {
+                    return handleFlowStep(phone, userId, message, session.currentStep, session.context)
+                }
+            }
+
+            // Handle swap intent
             if (simpleIntent === Intent.SWAP_TOKENS && session.currentStep === MainStep.IDLE) {
                 if (lastViewedToken) {
                     return handleSwapTokens(phone, userId, {});
                 }
             }
+
             return handleSimpleIntent(simpleIntent, phone, userId, session.currentStep);
         }
 
-        // If in middle of a flow, handle step-by-step
+        // ⭐ PRIORITY 6: If in middle of a flow, handle step-by-step (SKIP AI)
         if (session.currentStep !== MainStep.IDLE) {
+            console.log('📍 User in flow step:', session.currentStep)
             return handleFlowStep(phone, userId, message, session.currentStep, session.context);
         }
 
-        // Use AI for complex queries
-        console.log('🤖 Analyzing message with AI...');
+        // ⭐ PRIORITY 7: Use AI for complex queries WITH full context
+        console.log('🤖 Analyzing message with AI (with context)...');
 
         const safeUserName = user.name ?? 'User';
-        const safeProfileName = user.profileName ?? 'not set';
 
+        // ⭐ Pass session context to AI
         const aiResponse = await aiService.analyzeMessage(message, {
             userName: safeUserName,
+            sessionContext: sessionContext,  // ⭐ THIS IS THE FIX
+            lastViewedToken: lastViewedToken,
             conversationHistory: [
                 {
                     role: 'system',
-                    content: `Context: User's name is ${safeUserName}. User's profile name is ${safeProfileName}. ${lastViewedToken ? `User just viewed token: ${lastViewedToken.symbol} (${lastViewedToken.name}) on ${lastViewedToken.chain}` : ''}`,
+                    content: `User's name is ${safeUserName}. ${lastViewedToken ? `User just viewed token: ${lastViewedToken.symbol} (${lastViewedToken.name}) on ${lastViewedToken.chain}` : ''}`,
                 },
             ],
         });
@@ -508,7 +546,6 @@ async function handleMainFlow(phone: string, message: string): Promise<string> {
         return "I'm having trouble processing that right now. Type 'help' to see what I can do!";
     }
 }
-
 // ==================== TOKEN LOOKUP HANDLER ====================
 
 /**
