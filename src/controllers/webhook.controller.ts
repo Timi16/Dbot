@@ -219,6 +219,9 @@ async function checkBalanceAndGuide(
 /**
  * Main webhook handler - receives all incoming messages
  */
+/**
+ * 🔥 FIXED: Main webhook handler - properly handles new vs returning users
+ */
 export async function handleIncomingMessage(
     req: Request,
     res: Response
@@ -236,22 +239,61 @@ export async function handleIncomingMessage(
     console.log(`\n📨 Message received from ${phone}: "${message.substring(0, 50)}..."`)
 
     try {
-        // Update user's last active timestamp
-        await prisma.touchUser(phone).catch(() => {
-            // User might not exist yet, ignore error
+        // 🔥 FIX: Check user FIRST before touching
+        const existingUser = await prisma.user.findUnique({
+            where: { phone },
+            select: {
+                id: true,
+                onboardingStatus: true,
+                onboardingStep: true,
+                wallets: {
+                    select: { id: true }
+                }
+            }
         })
-
-        // Check if user exists and is onboarded
-        const isOnboarded = await prisma.isUserOnboarded(phone)
 
         let responseMessage: string
 
-        if (!isOnboarded) {
-            // Route to onboarding flow
+        // 🔥 SMART ROUTING: 
+        // 1. User doesn't exist → Start onboarding
+        // 2. User exists + COMPLETED → Main flow
+        // 3. User exists + IN_PROGRESS → Continue onboarding
+
+        if (!existingUser) {
+            console.log('🆕 New user detected - starting onboarding')
+
+            // Create user and start onboarding
+            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined)
+
+        } else if (existingUser.onboardingStatus === 'COMPLETED' && existingUser.wallets.length > 0) {
+            console.log('✅ Returning user - main flow')
+
+            // Update last active
+            await prisma.touchUser(phone, profileName)
+
+            // Casual greeting for "Hi" messages
+            if (isCasualMessage(message)) {
+                const displayName = existingUser.onboardingStep || 'there'
+                responseMessage = `Hey! 👋 Welcome back! Need help with anything? Type "help" to see commands.`
+            } else {
+                // Route to main conversation flow
+                responseMessage = await handleMainFlow(phone, message)
+            }
+
+        } else if (existingUser.onboardingStatus === 'IN_PROGRESS') {
+            console.log('🔄 User has incomplete onboarding - continuing')
+
+            // Update last active
+            await prisma.touchUser(phone, profileName)
+
+            // Continue onboarding from where they left off
             responseMessage = await handleOnboardingFlow(phone, message, profileName || undefined)
+
         } else {
-            // Route to main conversation flow
-            responseMessage = await handleMainFlow(phone, message)
+            console.log('⚠️ User in weird state - restarting onboarding')
+
+            // User exists but in weird state - restart onboarding
+            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined)
         }
 
         // Send response via Twilio
@@ -304,7 +346,6 @@ export async function handleIncomingMessage(
         res.status(200).send('OK')
     }
 }
-
 /**
  * Handle onboarding flow for new users
  */
@@ -320,16 +361,13 @@ async function handleOnboardingFlow(
     const simpleIntent = aiService.detectSimpleIntent(message)
 
     switch (progress.step) {
-        case OnboardingStep.AWAITING_NAME:
-            // First message - start onboarding
-            if (message.toLowerCase() === 'start' || message.toLowerCase() === 'hi' || !message) {
-                return onboardingService.startOnboarding(phone, profileName)
-            }
-            // User provided name
-            return onboardingService.processName(phone, message)
+        case OnboardingStep.AWAITING_PIN_CHOICE:
+            // First step - User choosing whether to set up PIN
+            // This handles "yes" or "no" responses
+            return onboardingService.handlePinChoice(phone, message)
 
         case OnboardingStep.AWAITING_PIN:
-            // User creating PIN
+            // User chose YES and is now creating PIN
             return onboardingService.processPin(phone, message)
 
         case OnboardingStep.CONFIRMING_PIN:
@@ -338,16 +376,17 @@ async function handleOnboardingFlow(
 
         case OnboardingStep.DISPLAYING_SEED:
             // Waiting for user to confirm they saved seed
-            if (simpleIntent === Intent.CONFIRM || message.toLowerCase() === 'saved') {
+            if (simpleIntent === Intent.CONFIRM || message.toLowerCase() === 'saved' || message.toLowerCase().includes('saved')) {
                 return onboardingService.confirmSeedSaved(phone)
             }
-            return 'Please type "SAVED" once you have securely written down your seed phrase.'
+            return `Please type "SAVED" once you've safely written down your recovery phrase. 📝\n\nThis is important - we can't recover it for you!`
 
         case OnboardingStep.COMPLETED:
-            // Should not reach here, but redirect to main flow
-            return 'Your wallet is ready! Type "help" to see what you can do.'
+            // Already completed - redirect to main flow
+            return `Your wallet is already set up! 🎉\n\nType *"help"* to see what you can do.`
 
         default:
+            // New user or unrecognized step - start onboarding
             return onboardingService.startOnboarding(phone, profileName)
     }
 }

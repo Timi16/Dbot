@@ -33,17 +33,22 @@ import {
 export class WalletService {
   /**
    * Create wallets for a new user (both SVM and EVM)
+   * @param userId - User ID
+   * @param pin - Optional PIN for encryption. If not provided, uses a default encryption
    */
   async createUserWallets(
     userId: string,
-    pin: string
+    pin?: string
   ): Promise<WalletCreationResult> {
     // Generate mnemonic
     const mnemonic = bip39.generateMnemonic(wordlist)
     const seed = VM.mnemonicToSeed(mnemonic)
 
-    // Encrypt seed with PIN
-    const { encrypted, salt } = encryptSeed(mnemonic, pin)
+    // Use provided PIN or a default value for users without PIN
+    const encryptionKey = pin || userId // If no PIN, use userId as encryption key
+    
+    // Encrypt seed
+    const { encrypted, salt } = encryptSeed(mnemonic, encryptionKey)
 
     // Create SVM wallet (Solana)
     const svmVM = new SVMVM(seed)
@@ -221,21 +226,35 @@ export class WalletService {
 
   /**
    * Get wallet instance (for transactions)
+   * @param pin - Optional. If user has no PIN, pass userId or leave empty
    */
   async getWalletInstance(
     userId: string,
     chainKey: ChainKey,
-    pin: string
+    pin?: string
   ): Promise<SVMChainWallet | EVMChainWallet> {
     const normalized = normalizeChainKey(chainKey)
     const wallet = await this.getUserWalletWithSeed(userId, normalized)
     const config = getChainConfig(normalized)
 
+    // Check if user has PIN enabled
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { pinEnabled: true }
+    })
+
+    // Use PIN if provided, otherwise use userId as decryption key
+    const decryptionKey = pin || (user?.pinEnabled ? null : userId)
+    
+    if (!decryptionKey) {
+      throw new ValidationError('PIN required but not provided')
+    }
+
     // Decrypt seed
-    const mnemonic = decryptSeed(wallet.encryptedSeed, pin, wallet.salt)
+    const mnemonic = decryptSeed(wallet.encryptedSeed, decryptionKey, wallet.salt)
     
     if (!mnemonic) {
-      throw new ValidationError('Invalid PIN')
+      throw new ValidationError('Invalid PIN or decryption failed')
     }
 
     const seed = VM.mnemonicToSeed(mnemonic)
@@ -254,9 +273,9 @@ export class WalletService {
   }
 
   /**
-   * Verify user's wallet PIN
+   * Verify user's wallet PIN (or userId for users without PIN)
    */
-  async verifyWalletPin(userId: string, pin: string): Promise<boolean> {
+  async verifyWalletPin(userId: string, pin?: string): Promise<boolean> {
     // Get any wallet to test decryption
     const wallets = await prisma.wallet.findMany({
       where: { userId },
@@ -273,15 +292,29 @@ export class WalletService {
       throw new NotFoundError('No wallets found')
     }
 
-    const mnemonic = decryptSeed(wallet.encryptedSeed, pin, wallet.salt)
+    // Check if user has PIN enabled
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { pinEnabled: true }
+    })
+
+    // Use PIN if provided, otherwise use userId
+    const decryptionKey = pin || (user?.pinEnabled ? null : userId)
+    
+    if (!decryptionKey) {
+      return false
+    }
+
+    const mnemonic = decryptSeed(wallet.encryptedSeed, decryptionKey, wallet.salt)
     
     return mnemonic !== null
   }
 
   /**
    * Get seed phrase (for backup/export)
+   * @param pin - Optional. If user has no PIN, it will use userId
    */
-  async getSeedPhrase(userId: string, pin: string): Promise<string> {
+  async getSeedPhrase(userId: string, pin?: string): Promise<string> {
     const wallets = await prisma.wallet.findMany({
       where: { userId },
       take: 1,
@@ -297,10 +330,23 @@ export class WalletService {
       throw new NotFoundError('No wallets found')
     }
 
-    const mnemonic = decryptSeed(wallet.encryptedSeed, pin, wallet.salt)
+    // Check if user has PIN enabled
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { pinEnabled: true }
+    })
+
+    // Use PIN if provided, otherwise use userId
+    const decryptionKey = pin || (user?.pinEnabled ? null : userId)
+    
+    if (!decryptionKey) {
+      throw new ValidationError('PIN required but not provided')
+    }
+
+    const mnemonic = decryptSeed(wallet.encryptedSeed, decryptionKey, wallet.salt)
     
     if (!mnemonic) {
-      throw new ValidationError('Invalid PIN')
+      throw new ValidationError('Invalid PIN or decryption failed')
     }
 
     return mnemonic

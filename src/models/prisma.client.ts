@@ -68,12 +68,23 @@ class ExtendedPrismaClient extends PrismaClient {
   }
 
   /**
-   * Custom method: Update user's last active timestamp
+   * 🔥 FIXED: Update user's last active timestamp
+   * Now uses UPSERT to handle new users automatically
    */
-  async touchUser(phone: string): Promise<void> {
-    await this.user.update({
+  async touchUser(phone: string, profileName?: string | null): Promise<void> {
+    await this.user.upsert({
       where: { phone },
-      data: { lastActive: new Date() },
+      update: { 
+        lastActive: new Date(),
+        updatedAt: new Date()
+      },
+      create: {
+        phone,
+        profileName: profileName || null,
+        name: profileName || null,
+        lastActive: new Date(),
+        // No onboardingStatus or onboardingStep - let defaults handle it
+      }
     })
   }
 
