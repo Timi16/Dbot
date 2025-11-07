@@ -27,7 +27,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "npm install && npx prisma generate && tsc && npx prisma migrate deploy",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
@@ -36,6 +36,9 @@
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
     "docker:logs": "docker-compose logs -f whatsapp-bot-app",
-    "docker:rebuild": "docker-compose up -d --build"
+    "docker:rebuild": "docker-compose up -d --build",
+    "prod": "npx pm2 start src/index.js --name whatsapp-crypto-bot --update-env",
+    "restart": "npx pm2 restart whatsapp-crypto-bot",
+    "stop": "npx pm2 stop whatsapp-crypto-bot && npx pm2 delete whatsapp-crypto-bot || true"
   }
 }
