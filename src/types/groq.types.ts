@@ -34,6 +34,8 @@ export enum Intent {
   // Confirmation
   CONFIRM = 'confirm',
   CANCEL = 'cancel',
+  SETUP = "SETUP",
+  WITHDRAW = "WITHDRAW",
 }
 
 export interface AIEntities {

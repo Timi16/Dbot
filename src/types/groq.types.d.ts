@@ -15,7 +15,9 @@ export declare enum Intent {
     HELP = "help",
     UNKNOWN = "unknown",
     CONFIRM = "confirm",
-    CANCEL = "cancel"
+    CANCEL = "cancel",
+    SETUP = "SETUP",
+    WITHDRAW = "WITHDRAW"
 }
 export interface AIEntities {
     chain?: 'solana' | 'ethereum' | 'base' | 'bsc' | '0g';

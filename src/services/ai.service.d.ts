@@ -67,6 +67,25 @@ export declare class AIService {
      * Extract address from message
      */
     extractAddress(message: string): string | null;
+    /**
+ * ✅ FIXED: extractTokens method with proper null checks
+ * Replace your current extractTokens method with this
+ */
+    extractTokens(message: string): {
+        from?: string;
+        to?: string;
+    };
+    extractChain(message: string): string | null;
+    preprocessMessage(message: string): {
+        intent: Intent | null;
+        chain: string | null;
+        amount: number | null;
+        address: string | null;
+        tokens: {
+            from?: string;
+            to?: string;
+        };
+    };
 }
 export declare const aiService: AIService;
 export {};

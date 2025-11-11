@@ -4,5 +4,4 @@ dist
 .env.local
 .git
 .gitignore
-*.md
 npm-debug.log

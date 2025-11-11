@@ -26,5 +26,7 @@ export var Intent;
     // Confirmation
     Intent["CONFIRM"] = "confirm";
     Intent["CANCEL"] = "cancel";
+    Intent["SETUP"] = "SETUP";
+    Intent["WITHDRAW"] = "WITHDRAW";
 })(Intent || (Intent = {}));
 //# sourceMappingURL=groq.types.js.map

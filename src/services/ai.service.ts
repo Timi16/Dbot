@@ -329,53 +329,79 @@ export class AIService {
             return null
         }
 
-        // ⭐ Context-aware cancel detection
+        // ⭐ Setup intent
+        const setupKeywords = ['setup', 'start', 'begin', 'create', 'get started', 'lets go']
+        if (setupKeywords.some(kw => lower.includes(kw))) {
+            return Intent.SETUP
+        }
+
+        // ⭐ Context-aware cancel
         if (sessionContext?.currentStep && sessionContext.currentStep !== 'IDLE') {
-            const cancelKeywords = ['no', 'n', 'cancel', 'stop', 'abort', 'nevermind', 'back', "i'm not", "not interested"]
-            if (cancelKeywords.some(kw => lower.includes(kw))) {
+            const cancelKeywords = ['no', 'n', 'cancel', 'stop', 'abort', 'nevermind', 'back']
+            if (cancelKeywords.some(kw => lower === kw || lower.startsWith(kw + ' '))) {
                 return Intent.CANCEL
             }
         }
 
-        // ⭐ Context-aware confirm detection
+        // ⭐ Context-aware confirm
         if (sessionContext?.currentStep && sessionContext.currentStep.includes('CONFIRM')) {
-            const confirmKeywords = ['yes', 'y', 'confirm', 'ok', 'okay', 'sure', 'proceed', 'continue']
+            const confirmKeywords = ['yes', 'y', 'confirm', 'ok', 'okay', 'sure', 'proceed', 'continue', 'go']
             if (confirmKeywords.includes(lower)) {
                 return Intent.CONFIRM
             }
         }
 
-        // Check for contract addresses with buy intent
-        const hasBuyKeyword = /\b(buy|purchase|get|swap|trade)\b/.test(lower)
-        const hasContractAddress = /\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b/.test(message)
+        // ⭐ FIXED: Better send/withdraw detection
+        const sendPatterns = [
+            /^send/i,
+            /^transfer/i,
+            /^pay/i,
+            /^withdraw/i,
+            /cash out/i,
+            /send .* to/i,
+            /transfer .* to/i,
+        ]
+        if (sendPatterns.some(pattern => pattern.test(lower))) {
+            return Intent.SEND_CRYPTO
+        }
 
-        if (hasBuyKeyword && hasContractAddress) {
+        // ⭐ FIXED: Better swap detection
+        const swapPatterns = [
+            /^swap/i,
+            /^trade/i,
+            /^exchange/i,
+            /^buy/i,
+            /^purchase/i,
+            /swap .* for/i,
+            /trade .* for/i,
+            /buy .*sol/i,
+            /buy .*eth/i,
+            /buy .*usdc/i,
+        ]
+        if (swapPatterns.some(pattern => pattern.test(lower))) {
             return Intent.SWAP_TOKENS
         }
 
-        // Confirmation keywords (only if NOT in a flow)
-        if (!sessionContext?.currentStep || sessionContext.currentStep === 'IDLE') {
-            const confirmKeywords = ['yes', 'y', 'confirm', 'ok', 'okay', 'sure', 'proceed', 'continue', 'saved']
-            if (confirmKeywords.includes(lower)) {
-                return Intent.CONFIRM
-            }
+        // ⭐ Balance check
+        const balanceKeywords = ['balance', 'how much', 'check', 'wallet', 'funds']
+        if (balanceKeywords.some(kw => lower.includes(kw))) {
+            return Intent.CHECK_BALANCE
         }
 
-        // Help keywords
-        const helpKeywords = ['help', 'menu', 'commands', 'options']
-        if (helpKeywords.includes(lower)) {
+        // ⭐ Address/receive
+        const addressKeywords = ['address', 'receive', 'deposit', 'fund', 'my wallet']
+        if (addressKeywords.some(kw => lower.includes(kw))) {
+            return Intent.VIEW_ADDRESS
+        }
+
+        // ⭐ Help
+        if (lower === 'help' || lower === 'menu' || lower === 'commands' || lower === 'what can you do') {
             return Intent.HELP
         }
 
-        // Trading keywords (without addresses - just simple words)
-        const buyKeywords = ['buy', 'purchase', 'get']
-        if (buyKeywords.includes(lower)) {
-            return Intent.SWAP_TOKENS
-        }
-
-        const swapKeywords = ['swap', 'trade', 'exchange']
-        if (swapKeywords.includes(lower)) {
-            return Intent.SWAP_TOKENS
+        // ⭐ History
+        if (lower.includes('history') || lower.includes('transactions') || lower === 'txs') {
+            return Intent.TRANSACTION_HISTORY
         }
 
         return null
@@ -443,8 +469,112 @@ export class AIService {
             return evmMatch[0]
         }
 
+        // Match phone numbers for naira transfers (optional future feature)
+        const phoneMatch = message.match(/\b(\+?\d{10,15})\b/)
+        if (phoneMatch?.[0]) {
+            return phoneMatch[0]
+        }
+
         return null
     }
+
+    /**
+ * ✅ FIXED: extractTokens method with proper null checks
+ * Replace your current extractTokens method with this
+ */
+
+    extractTokens(message: string): { from?: string; to?: string } {
+        const lower = message.toLowerCase()
+
+        // Common tokens
+        const tokens = ['sol', 'eth', 'bnb', 'usdc', 'usdt', '0g', 'matic', 'dai']
+
+        // Try to find "X for Y" or "X to Y" pattern
+        const swapMatch = lower.match(/(?:swap|trade|exchange)\s+(\w+)\s+(?:for|to)\s+(\w+)/i)
+
+        // ✅ FIX: Check if both swapMatch[1] and swapMatch[2] exist
+        if (swapMatch && swapMatch[1] && swapMatch[2]) {
+            return {
+                from: swapMatch[1].toUpperCase(),
+                to: swapMatch[2].toUpperCase()
+            }
+        }
+
+        // Try to find "buy X" pattern
+        const buyMatch = lower.match(/(?:buy|purchase|get)\s+(?:\d+\s+)?(\w+)/i)
+
+        // ✅ FIX: Check if buyMatch[1] exists
+        if (buyMatch && buyMatch[1]) {
+            const token = buyMatch[1].toUpperCase()
+            if (tokens.includes(token.toLowerCase())) {
+                return { to: token }
+            }
+        }
+
+        // Look for any mentioned tokens
+        const mentioned = tokens.filter(t => lower.includes(t))
+
+        // ✅ FIX: Check if mentioned[0] and mentioned[1] exist
+        if (mentioned.length >= 2) {
+            const from = mentioned[0]
+            const to = mentioned[1]
+
+            // Extra safety: verify both exist before using
+            if (from && to) {
+                return {
+                    from: from.toUpperCase(),
+                    to: to.toUpperCase()
+                }
+            }
+        } else if (mentioned.length === 1) {
+            const token = mentioned[0]
+
+            // ✅ FIX: Check if mentioned[0] exists
+            if (token) {
+                return { to: token.toUpperCase() }
+            }
+        }
+
+        return {}
+    }
+    extractChain(message: string): string | null {
+        const lower = message.toLowerCase()
+
+        // Solana aliases
+        if (/\b(sol|solana)\b/i.test(lower)) return 'solana'
+
+        // Ethereum aliases
+        if (/\b(eth|ethereum)\b/i.test(lower)) return 'ethereum'
+
+        // BSC aliases
+        if (/\b(bnb|bsc|binance)\b/i.test(lower)) return 'bsc'
+
+        // Base
+        if (/\bbase\b/i.test(lower)) return 'base'
+
+        // 0G
+        if (/\b0g\b/i.test(lower)) return '0g'
+
+        return null
+    }
+
+    preprocessMessage(message: string): {
+        intent: Intent | null
+        chain: string | null
+        amount: number | null
+        address: string | null
+        tokens: { from?: string, to?: string }
+    } {
+        return {
+            intent: this.detectSimpleIntent(message),
+            chain: this.extractChain(message),
+            amount: this.extractAmount(message),
+            address: this.extractAddress(message),
+            tokens: this.extractTokens(message)
+        }
+    }
+
+
 }
 
 // Export singleton instance

@@ -12,6 +12,9 @@ export declare function isCasualMessage(message: string): boolean;
  */
 export declare function handleIncomingMessage(req: Request, res: Response): Promise<void>;
 /**
+ * Get help message
+ */
+/**
  * Handle message status updates (optional)
  */
 export declare function handleMessageStatus(req: Request, res: Response): Promise<void>;

@@ -161,7 +161,6 @@ async function checkBalanceAndGuide(userId, chain, amount, tokenSymbol) {
 export async function handleIncomingMessage(req, res) {
     const startTime = Date.now();
     const payload = req.body;
-    // Extract data from webhook
     const whatsappNumber = payload.From;
     const phone = extractPhoneNumber(whatsappNumber);
     const message = sanitizeInput(payload.Body);
@@ -169,11 +168,11 @@ export async function handleIncomingMessage(req, res) {
     const messageSid = payload.MessageSid;
     console.log(`\n📨 Message received from ${phone}: "${message.substring(0, 50)}..."`);
     try {
-        // 🔥 FIX: Check user FIRST before touching
         const existingUser = await prisma.user.findUnique({
             where: { phone },
             select: {
                 id: true,
+                name: true,
                 onboardingStatus: true,
                 onboardingStep: true,
                 wallets: {
@@ -182,48 +181,62 @@ export async function handleIncomingMessage(req, res) {
             }
         });
         let responseMessage;
-        // 🔥 SMART ROUTING: 
-        // 1. User doesn't exist → Start onboarding
-        // 2. User exists + COMPLETED → Main flow
-        // 3. User exists + IN_PROGRESS → Continue onboarding
+        // ⭐ NEW USER - Show welcome message FIRST
         if (!existingUser) {
-            console.log('🆕 New user detected - starting onboarding');
-            // Create user and start onboarding
-            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined);
+            console.log('🆕 New user detected - showing welcome message');
+            responseMessage = getWelcomeMessage(profileName || 'there');
+            // Don't create user yet - wait for them to type "setup"
+            await twilioService.sendMessage({
+                to: phone,
+                message: responseMessage,
+            });
+            await prisma.logWebhook({
+                phone,
+                message,
+                profileName,
+                messageSid,
+                responseStatus: 'success',
+                responseMessage: responseMessage.substring(0, 200),
+                processingTime: Date.now() - startTime,
+                errorDetails: null,
+            });
+            res.status(200).send('OK');
+            return;
         }
-        else if (existingUser.onboardingStatus === 'COMPLETED' && existingUser.wallets.length > 0) {
+        // ⭐ EXISTING USER - Check if completed onboarding
+        if (existingUser.onboardingStatus === 'COMPLETED' && existingUser.wallets.length > 0) {
             console.log('✅ Returning user - main flow');
-            // Update last active
             await prisma.touchUser(phone, profileName);
-            // Casual greeting for "Hi" messages
+            // Show welcome back message for casual greetings
             if (isCasualMessage(message)) {
-                const displayName = existingUser.onboardingStep || 'there';
-                responseMessage = `Hey! 👋 Welcome back! Need help with anything? Type "help" to see commands.`;
+                const displayName = existingUser.name || 'there';
+                responseMessage = `Hey ${displayName}! 👋 Welcome back!\n\n` +
+                    `What would you like to do?\n\n` +
+                    `💰 Check balance\n` +
+                    `📤 Send/Withdraw\n` +
+                    `🔄 Swap tokens\n` +
+                    `📥 Fund wallet\n\n` +
+                    `Just type what you need!`;
             }
             else {
-                // Route to main conversation flow
                 responseMessage = await handleMainFlow(phone, message);
             }
         }
+        // ⭐ IN PROGRESS - Continue onboarding
         else if (existingUser.onboardingStatus === 'IN_PROGRESS') {
             console.log('🔄 User has incomplete onboarding - continuing');
-            // Update last active
             await prisma.touchUser(phone, profileName);
-            // Continue onboarding from where they left off
             responseMessage = await handleOnboardingFlow(phone, message, profileName || undefined);
         }
+        // ⭐ WEIRD STATE - Show welcome again
         else {
-            console.log('⚠️ User in weird state - restarting onboarding');
-            // User exists but in weird state - restart onboarding
-            responseMessage = await onboardingService.startOnboarding(phone, profileName || undefined);
+            console.log('⚠️ User in weird state - showing welcome');
+            responseMessage = getWelcomeMessage(existingUser.name || 'there');
         }
-        // Send response via Twilio
         await twilioService.sendMessage({
             to: phone,
             message: responseMessage,
         });
-        // Log webhook for debugging
-        const processingTime = Date.now() - startTime;
         await prisma.logWebhook({
             phone,
             message,
@@ -231,16 +244,14 @@ export async function handleIncomingMessage(req, res) {
             messageSid,
             responseStatus: 'success',
             responseMessage: responseMessage.substring(0, 200),
-            processingTime,
+            processingTime: Date.now() - startTime,
             errorDetails: null,
         });
-        console.log(`✅ Response sent to ${phone} (${processingTime}ms)`);
-        // Respond to Twilio with 200 OK
+        console.log(`✅ Response sent to ${phone} (${Date.now() - startTime}ms)`);
         res.status(200).send('OK');
     }
     catch (error) {
         console.error('❌ Error handling webhook:', error);
-        // Log error
         await prisma.logWebhook({
             phone,
             message,
@@ -251,48 +262,61 @@ export async function handleIncomingMessage(req, res) {
             errorDetails: error instanceof Error ? error.message : 'Unknown error',
             processingTime: Date.now() - startTime,
         });
-        // Send user-friendly error message
         const errorMessage = getUserFriendlyErrorMessage(error);
         await twilioService
             .sendMessage({ to: phone, message: errorMessage })
             .catch((sendError) => {
             console.error('Failed to send error message:', sendError);
         });
-        // Still respond 200 to Twilio (prevent retries)
         res.status(200).send('OK');
     }
+}
+/**
+ * ⭐ NEW: Welcome message for new users
+ */
+function getWelcomeMessage(name) {
+    return `Hey ${name}! 👋 Welcome to *Decane AI*\n\n` +
+        `Your smart crypto wallet powered by Decane! 🚀\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `*What You Can Do:*\n\n` +
+        `💰 Send Naira instantly using tokens\n` +
+        `📥 Fund your wallet with Naira\n` +
+        `📤 Send any token to anyone\n` +
+        `🛒 Buy any token with your balance\n` +
+        `💸 Withdraw to your bank\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🎯 *Ready to get started?*\n\n` +
+        `Type *"setup"* to create your wallet!\n\n` +
+        `_It only takes 30 seconds!_`;
 }
 /**
  * Handle onboarding flow for new users
  */
 async function handleOnboardingFlow(phone, message, profileName) {
+    const simpleIntent = aiService.detectSimpleIntent(message);
+    // Check if user wants to setup
+    if (simpleIntent === Intent.SETUP) {
+        return onboardingService.startOnboarding(phone, profileName);
+    }
     // Get current progress
     const progress = await onboardingService.getProgress(phone);
-    // Check simple intents first (yes/no/cancel)
-    const simpleIntent = aiService.detectSimpleIntent(message);
     switch (progress.step) {
         case OnboardingStep.AWAITING_PIN_CHOICE:
-            // First step - User choosing whether to set up PIN
-            // This handles "yes" or "no" responses
             return onboardingService.handlePinChoice(phone, message);
         case OnboardingStep.AWAITING_PIN:
-            // User chose YES and is now creating PIN
             return onboardingService.processPin(phone, message);
         case OnboardingStep.CONFIRMING_PIN:
-            // User confirming PIN
             return onboardingService.confirmPin(phone, message);
         case OnboardingStep.DISPLAYING_SEED:
-            // Waiting for user to confirm they saved seed
             if (simpleIntent === Intent.CONFIRM || message.toLowerCase() === 'saved' || message.toLowerCase().includes('saved')) {
                 return onboardingService.confirmSeedSaved(phone);
             }
-            return `Please type "SAVED" once you've safely written down your recovery phrase. 📝\n\nThis is important - we can't recover it for you!`;
+            return `Please type "SAVED" once you've safely written down your recovery phrase. 📝`;
         case OnboardingStep.COMPLETED:
-            // Already completed - redirect to main flow
             return `Your wallet is already set up! 🎉\n\nType *"help"* to see what you can do.`;
         default:
-            // New user or unrecognized step - start onboarding
-            return onboardingService.startOnboarding(phone, profileName);
+            // Not in onboarding - ask them to setup
+            return `Looks like you haven't set up your wallet yet!\n\nType *"setup"* to get started! 🚀`;
     }
 }
 /**
@@ -354,7 +378,7 @@ async function handleMainFlow(phone, message) {
                 `Hello ${displayName}! 😊 All good here! What would you like to do?`,
                 `Hey! 👋 I'm here and ready to help! Need to check your balance, swap tokens, or something else?`,
             ];
-            return casualResponses[Math.floor(Math.random() * casualResponses.length)];
+            casualResponses[Math.floor(Math.random() * casualResponses.length)];
         }
         // ⭐ PRIORITY 4: Check if message is JUST a contract address (no buy intent)
         const trimmedMessage = message.trim();
@@ -634,11 +658,16 @@ async function handleFlowStep(phone, userId, message, currentStep, context) {
 async function routeByIntent(intent, phone, userId, entities, aiResponse) {
     try {
         switch (intent) {
+            case Intent.SETUP:
+                // Start onboarding
+                const user = await prisma.user.findUnique({ where: { id: userId } });
+                return onboardingService.startOnboarding(user?.phone || phone, user?.name || undefined);
             case Intent.CHECK_BALANCE:
                 return handleCheckBalance(userId, entities.chain);
             case Intent.VIEW_ADDRESS:
                 return handleViewAddress(userId, entities.chain);
             case Intent.SEND_CRYPTO:
+            case Intent.WITHDRAW: // ⭐ NEW: Treat same as send
                 return handleSendCrypto(phone, userId, entities);
             case Intent.RECEIVE_CRYPTO:
                 return handleReceiveCrypto(userId, entities.chain);
@@ -649,7 +678,6 @@ async function routeByIntent(intent, phone, userId, entities, aiResponse) {
             case Intent.SETTINGS:
                 return handleSettings(userId);
             case Intent.HELP:
-                // Use AI's custom response if available, otherwise use default
                 return aiResponse || getHelpMessage();
             default:
                 return aiResponse || "I didn't quite understand that. Type 'help' to see what I can do!";
@@ -661,6 +689,28 @@ async function routeByIntent(intent, phone, userId, entities, aiResponse) {
     }
 }
 /**
+ * ⭐ FIXED: Better help message
+ */
+function getHelpMessage() {
+    return `*Decane AI - Quick Guide*\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💰 *Check Balance*\n` +
+        `"balance" or "how much do I have?"\n\n` +
+        `📤 *Send/Withdraw*\n` +
+        `"send 1000 naira to [phone]"\n` +
+        `"withdraw 0.5 SOL to [address]"\n\n` +
+        `📥 *Fund Wallet*\n` +
+        `"show my address" or "receive"\n\n` +
+        `🔄 *Swap/Buy*\n` +
+        `"swap SOL for USDC"\n` +
+        `"buy 100 worth of SOL"\n\n` +
+        `📜 *History*\n` +
+        `"show transactions"\n\n` +
+        `🪙 *Token Info*\n` +
+        `Paste any contract address\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💡 Just chat naturally - I understand! 😊`;
+} /**
  * Handle check balance intent
  */
 async function handleCheckBalance(userId, chain) {
@@ -1173,9 +1223,9 @@ async function executeSwapTransaction(userId, params) {
 /**
  * Get help message
  */
-function getHelpMessage() {
-    return `🤖 Here's what I can do:\n\n💰 Check Balance - "balance" or "how much SOL do I have?"\n\n📤 Send Crypto - "send 0.5 SOL to [address]"\n\n📥 Receive - "show my address" or "receive"\n\n🔄 Swap - "swap ETH for USDC"\n\n📜 History - "show transactions"\n\n⚙️ Settings - "settings"\n\n🪙 Token Info - Paste any contract address\n\nJust chat naturally! I'll understand. 😊`;
-}
+// function getHelpMessage(): string {
+//     return `🤖 Here's what I can do:\n\n💰 Check Balance - "balance" or "how much SOL do I have?"\n\n📤 Send Crypto - "send 0.5 SOL to [address]"\n\n📥 Receive - "show my address" or "receive"\n\n🔄 Swap - "swap ETH for USDC"\n\n📜 History - "show transactions"\n\n⚙️ Settings - "settings"\n\n🪙 Token Info - Paste any contract address\n\nJust chat naturally! I'll understand. 😊`
+// }
 /**
  * Handle message status updates (optional)
  */
